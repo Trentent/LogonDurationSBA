@@ -1,5 +1,5 @@
-﻿#requires -version 3.0
-
+﻿ #requires -version 3.0
+ 
 <#
  	.SYNOPSIS
         An advanced function that gives you a break-down analysis of a user's most recent logon on the machine.
@@ -53,9 +53,10 @@
 		Gets analysis of the logon process for the user 'Rick' in the current domain.
 #>
 
-## Last modified 1236 GMT 28/09/18 @guyrleech
+## Last modified 1641 GMT 10/04/19 @guyrleech
 
 [int]$outputWidth = 400
+$DebugPreference = 'Continue'
 
 function Get-LogonDurationAnalysis {
     [CmdletBinding(DefaultParameterSetName="None")]
@@ -137,17 +138,24 @@ function Get-LogonDurationAnalysis {
 
         ## array indexes for event log property fields to make retrieval more meaningful
         ## Event id 4688 (process start)
-        Set-Variable -Name SubjectLogonId -Value 3 -Option ReadOnly
-        Set-Variable -Name ProcessIdNew   -Value 4 -Option ReadOnly
-        Set-Variable -Name NewProcessName -Value 5 -Option ReadOnly
-        Set-Variable -Name ProcessIdStart -Value 7 -Option ReadOnly
+  
+        Set-Variable -Name SubjectUserName   -Value 1  -Option ReadOnly
+        Set-Variable -Name SubjectDomainName -Value 2  -Option ReadOnly
+        Set-Variable -Name SubjectLogonId    -Value 3  -Option ReadOnly
+        Set-Variable -Name ProcessIdNew      -Value 4  -Option ReadOnly
+        Set-Variable -Name NewProcessName    -Value 5  -Option ReadOnly
+        Set-Variable -Name ProcessIdStart    -Value 7  -Option ReadOnly
+        Set-Variable -Name TargetLogonId     -Value 12 -Option ReadOnly
+        Set-Variable -Name ParentProcessName -Value 13 -Option ReadOnly
+        
+        [bool]$SearchCommandLine = $false
         if ([version](Get-CimInstance Win32_OperatingSystem).version -gt ([version]6.1)) { #are we using a version of Windows newer than Windows 2008R2/Windows 7?
-            if (Test-Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit -ErrorAction SilentlyContinue) {
-                $commandLinePolicy = Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit -Name ProcessCreationIncludeCmdLine_Enabled -ErrorAction SilentlyContinue
-                if ($commandLinePolicy.ProcessCreationIncludeCmdLine_Enabled -like "*1*") {
+            if (Test-Path -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -ErrorAction SilentlyContinue) {
+                $commandLinePolicy = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name 'ProcessCreationIncludeCmdLine_Enabled' -ErrorAction SilentlyContinue
+                if ($commandLinePolicy.ProcessCreationIncludeCmdLine_Enabled -eq 1) {
                     if (-not($(Get-AuditSettings) -like "*Process Termination*")) { #need process termination auditing enabled or else we can't find when the process finishes
                         Set-Variable -Name CommandLine -Value 8 -Option ReadOnly
-                        Set-Variable -Name SearchCommandLine -Value $true
+                        $SearchCommandLine = $true
                     }
                 }
             }
@@ -156,8 +164,6 @@ function Get-LogonDurationAnalysis {
         ## Event id 4689 (process stop)
         Set-Variable -Name ProcessIdStop  -Value 5 -Option ReadOnly
         Set-Variable -Name ProcessName    -Value 6 -Option ReadOnly
-
-        
 
         # Generate a new XPath string
         function New-XPath {
@@ -201,14 +207,14 @@ function Get-LogonDurationAnalysis {
                 $ecounter++
             }
             if ($ToDate) {
-                [void]$sb.Append(") and TimeCreated[@SystemTime$($greaterThan)='$($FromDate.ToUniversalTime().ToString("s"))'")
-                [void]$sb.Append(" and @SystemTime$($lessThan)='$($ToDate.ToUniversalTime().ToString("s"))']")
+                [void]$sb.Append(") and TimeCreated[@SystemTime$($greaterThan)='$($FromDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))'")
+                [void]$sb.Append(" and @SystemTime$($lessThan)='$($ToDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))']")
                 if (!$SecurityData) {
                     [void]$sb.Append("]]")
                 }
             }
             elseif ($FromDate) {
-                [void]$sb.Append(") and TimeCreated[@SystemTime$($greaterThan)='$($FromDate.ToUniversalTime().ToString("s"))']")
+                [void]$sb.Append(") and TimeCreated[@SystemTime$($greaterThan)='$($FromDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))']")
                 if (!$SecurityData) {
                     [void]$sb.Append("]]")
                 }
@@ -494,8 +500,10 @@ function Get-LogonDurationAnalysis {
                 }
             }
             catch {
-	            $PSCmdlet.WriteWarning((("Could not initiate a connection to {0} with SessionKey: {1},`n {2}`n" +
-                    "Make sure the user has at least the `"Read-Only Administrator`" role") -f $DDC, $CtxSessionsKey, $Error[0].Exception.Message))
+                Write-Verbose "Could not initiate a connection to $DDC with SessionKey: $CtxSessionsKey,`n $($Error[0].Exception.Message)`n Make sure the user has at least the `"Read-Only Administrator`" role"
+
+	            $PSCmdlet.WriteWarning((("Could not initiate a connection to {0},`n {1}`n" +
+                    "Make sure the user has at least the `"Read-Only Administrator`" role") -f $DDC, $Error[0].Exception.Message))
 	        }
         }
 
@@ -604,10 +612,22 @@ function Get-LogonDurationAnalysis {
             }
 
             if (-not(Test-Path HKU:\$($Logon.UserSID)\Printers\Connections\ -ErrorAction SilentlyContinue)) {
-                $PSCmdlet.WriteWarning( "User is not logged on.  Printer information will be incomplete, inaccurate or missing." ) #we'll do our best though with what's available
+                Write-Verbose "Unable to find mapped printers in the user session."  #we'll do our best though with what's available
             } else {
                 $UserPrinterGUIDs += Get-ItemProperty -Path HKU:\$($Logon.UserSID)\Printers\Connections\* -Name GuidPrinter
-                $PrinterClientSidePortGUIDs += Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider\Servers\printsrv\Monitors\Client Side Port\*" -Name PrinterPath
+                $PrintServers = (Get-ChildItem -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider\Servers").PSChildName
+                Write-Verbose "Found the following print servers:"
+                Write-Verbose "$printServers"
+                foreach ($printServer in $printServers) {
+                  $PrinterClientSidePortGUIDs += Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider\Servers\$printServer\Monitors\Client Side Port\*" -Name PrinterPath
+                }
+                if ($DebugPreference -eq "continue") {
+                    Write-Debug "Printer GUIDS:"
+                    foreach ($ClientSidePortGUID in $PrinterClientSidePortGUIDs) {
+                        Write-Debug "$($ClientSidePortGUID.printerPath)"
+                    }
+                }
+    
             }
             [array]$printerTaskEvents = @( Get-WinEvent -FilterHashtable @{ProviderName='Microsoft-Windows-PrintService';StartTime=$start;EndTime=$end;Id=300,306} -ErrorAction SilentlyContinue )
             if ($printerTaskEvents.count -eq 0) {
@@ -862,7 +882,7 @@ function Get-LogonDurationAnalysis {
                     [hashtable]$eventData = @{
                                 TargetUserName=$UserName
                                 TargetDomainName=$UserDomain
-                                LogonType=@(2,10,11)
+                                LogonType=@(2,10,11,12)
                                 ProcessName='C:\Windows\System32\svchost.exe'
                             }
                     if( $wmiEvent )
@@ -904,9 +924,9 @@ function Get-LogonDurationAnalysis {
                     ## 'Begin session arbitration' but happens before event id 21 'Remote Desktop Services: Session logon succeeded' so we must search around that time
                     $LSMEvent = Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-TerminalServices-LocalSessionManager -FilterXPath (
                         New-XPath -EventId 41 -UserData @{User="$UserDomain\$UserName"} `
-                        -ToDate $tsevent.TimeCreated -encode `
+                        -ToDate $tsevent.TimeCreated.AddSeconds( 1 ) -encode `
                         -FromDate (Get-Date $tsevent.TimeCreated).AddSeconds( -300 ) ) `
-                            -ErrorAction Stop -Verbose:$False
+                            -ErrorAction Continue -Verbose:$False
                 
                     if( $LSMEvent )
                     {
@@ -1055,12 +1075,14 @@ function Get-LogonDurationAnalysis {
                 $odataPhase = Get-ODataPhase
             }
             else {
-                $PSCmdlet.WriteWarning(("Could not get `"HDX Connection`",`n" +
-                    "Username or/and Password for the XenDesktop Site is missing."))
+                Write-Host "INFO: No credentials entered for the XenDesktop username/password fields"
             }
         }
+        ## Get all security events so we can see how many there are in a given time to show approx rate of entries
+        [array]$allSecurityEvents = @( Get-WinEvent -FilterHashtable @{LogName='Security'} )
         ## Get all security events that we will need so we can search this list rather than going to event log every time
-        [array]$securityEvents = @( Get-WinEvent -FilterHashtable @{LogName='Security';StartTime=$logon.LogonTime;EndTime=($logon.LogonTime.AddMinutes( 60 ));Id=4018,5018,4688,4689} )
+        [array]$securityEventsEvt = @( Get-WinEvent -FilterHashtable @{LogName='Security';StartTime=$logon.LogonTime;EndTime=($logon.LogonTime.AddMinutes( 60 ));Id=4018,5018,4688,4689} )
+        [array]$securityEvents = @( allSecurityEvents | Where-Object { $_.TimeCreated -ge $logon.LogonTime -and $_.TimeCreated -le $logon.LogonTime.AddMinutes( 60 ) -and $_.Id -in @( 4018,5018,4688,4689 ) } )
 
         $networkStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$ProcessIdStart].value -eq $Logon.WinlogonPID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1 )
         if( $networkStartEvent )
@@ -1162,6 +1184,39 @@ function Get-LogonDurationAnalysis {
             Write-Warning "Unable to find Pre-Shell (Userinit) start event"
         }
 
+        ## See if user has a login script in AD and if so look for start and end in process start/stop events
+        $ADuser = ([ADSI]"WinNT://$UserDomain/$Username,user")
+        if( $ADUser -and $ADuser.LoginScript )
+        {
+            if( $searchCommandLine )
+            {
+                ## could be more than one since usrlogon.cmd may also be launched so need to check we have the right one although not checking down to which server as can't. Don't check for actual process as could be cmd, wscript, etc
+                [string]$escapedLogonScript = [regex]::Escape( ( Join-Path -Path '\NETLOGON' -ChildPath ($ADuser.LoginScript.ToString()) ) )
+                $logonScriptStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$SubjectUserName].value -eq $userName -and $_.Properties[$SubjectDomainName].value -eq $UserDomain `
+                     -and $_.Properties[$CommandLine].value -match $escapedLogonScript -and $_.Properties[$ParentProcessName].value -eq 'C:\Windows\System32\userinit.exe' } ) | Select -Last 1
+                if( $logonScriptStartEvent )
+                {
+                    $Script:Output += Get-PhaseEventFromCache -PhaseName 'User logon script' `
+                        -startEvent $logonScriptStartEvent `
+                        -endEvent ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.TimeCreated -ge $userinitStartEvent.TimeCreated -and $_.Properties[$ProcessIdStop].value -eq $logonScriptStartEvent.Properties[$ProcessIdNew].value -and $_.Properties[$SubjectLogonId].value -eq $logonScriptStartEvent.Properties[$SubjectLogonId].value } | Select -Last 1)
+                }
+            }
+            else
+            {
+                $logonScriptStartEvent = $null
+            }
+
+            if( ! $logonScriptStartEvent )
+            {
+                [string]$warning = "Unable to find user logon script ($($ADUser.LoginScript)) start event"
+                if( $commandLinePolicy.ProcessCreationIncludeCmdLine_Enabled -ne 1 )
+                {
+                    $warning += ', "Command line process auditing" is not enabled'
+                }
+                Write-Warning $warning
+            }
+        }
+
         if ($CUDesktopLoadTime -gt 0 ) {
             $shellStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$SubjectLogonId].value -eq $Logon.LogonID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\explorer.exe' } | Select -Last 1 ) 
             if( $shellStartEvent )
@@ -1181,7 +1236,7 @@ function Get-LogonDurationAnalysis {
         $jobs.clear()
 
         $Script:GPAsync = $sharedVars[ 'GPASync' ]
-
+        Write-Debug "Get-PrinterEvents -Start $($userinitStartEvent.TimeCreated) -End $(($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}).EndTime) -ClientName $ClientName"
         Get-PrinterEvents -Start $userinitStartEvent.TimeCreated -End ($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}).EndTime -ClientName $ClientName
 
         if (($Script:Output).Length -lt 2 ) {
@@ -1416,12 +1471,18 @@ $sessionArray = @()
 foreach ($line in $sessionInfo) {
     $sessionInfoObject = New-Object System.Object
     foreach ($object in ($line -split "\t")) {
-        if ($object -like "*UserName*") { $sessionInfoObject | Add-Member -type NoteProperty -name UserName -value ($object -split ":")[1] }
-        if ($object -like "*SessionID*") { $sessionInfoObject | Add-Member -type NoteProperty -name SessionID -value ($object -split ":")[1] }
-        if ($object -like "*ClientName*") { $sessionInfoObject | Add-Member -type NoteProperty -name ClientName -value ($object -split ":")[1] }
-        if ($object -like "*SessionName*") { $sessionInfoObject | Add-Member -type NoteProperty -name SessionName -value ($object -split ":")[1] }
+    
+        if ($object -like "*UserName*") { Write-Debug "Username: $object"
+            $sessionInfoObject | Add-Member -type NoteProperty -name UserName -value ($object -split ":")[1] }
+        if ($object -like "*SessionID*") { Write-Debug "SessionID: $object"
+            $sessionInfoObject | Add-Member -type NoteProperty -name SessionID -value ($object -split ":")[1] }
+        if ($object -like "*ClientName*") { Write-Debug "ClientName: $object"
+            $sessionInfoObject | Add-Member -type NoteProperty -name ClientName -value ($object -split ":")[1] }
+        if ($object -like "*SessionName*") { Write-Debug "SessionName: $object"
+            $sessionInfoObject | Add-Member -type NoteProperty -name SessionName -value ($object -split ":")[1] }
     }
     $sessionArray += $sessionInfoObject
+    
 }
 #endregion
 
@@ -1445,8 +1506,17 @@ foreach ($session in $sessionArray) {
 
 if (-not($foundAllParameters)) {
     Write-Verbose "Only partial parameters found"
-    $SessionName = $null
-    $clientName = $null
+    $UserTest = $args[0]
+    $count = ($sessionArray | Where-Object -FilterScript { $_.UserName -eq $UserTest }).Count
+    Write-Verbose "Found $count number of sessions for $($args[0])"
+    if ($count -eq 1) {
+        $ClientName = ($sessionArray | Where-Object -FilterScript { $_.UserName -eq $UserTest }).ClientName
+        $SessionName = ($sessionArray | Where-Object -FilterScript { $_.UserName -eq $UserTest }).SessionName
+        $SessionId = ($sessionArray | Where-Object -FilterScript { $_.UserName -eq $UserTest }).SessionId
+    } else {
+        $SessionName = $null
+        $clientName = $null
+    }
 }
 
 if ($args[5] -and $args[6]) {
@@ -1467,19 +1537,12 @@ Write-Debug "SessionName: $SessionName"
 Write-Debug "SessionId:   $SessionID"
 Write-Debug "XDUsername:  $XDUserName"
 
-
-try {
-    if ($SessionName -imatch "RDP") {
-            Get-LogonDurationAnalysis -Username $Username -UserDomain  $UserDomain -CUDesktopLoadTime $args[1] -ClientName $clientName
-        }
-    if ($XDUsername -ne $null -and $XDPassword -ne $null) {
-        Get-LogonDurationAnalysis -Username $Username -UserDomain  $Userdomain -CUDesktopLoadTime $args[1] -HDXSessionId $SessionId `
-        -XDUsername $XDUsername -XDPassword (ConvertTo-SecureString "$XDPassword" -AsPlainText -Force) -ClientName $clientName
-    } else {
-        Get-LogonDurationAnalysis -Username $Username -UserDomain  $Userdomain -CUDesktopLoadTime $args[1] -HDXSessionId $SessionId -ClientName $clientName
+if ($SessionName -imatch "RDP") {
+        Get-LogonDurationAnalysis -Username $Username -UserDomain  $UserDomain -CUDesktopLoadTime $args[1] -ClientName $clientName
     }
+elseif ($XDUsername -ne $null -and $XDPassword -ne $null) {
+    Get-LogonDurationAnalysis -Username $Username -UserDomain  $Userdomain -CUDesktopLoadTime $args[1] -HDXSessionId $SessionId `
+    -XDUsername $XDUsername -XDPassword (ConvertTo-SecureString "$XDPassword" -AsPlainText -Force) -ClientName $clientName
+} else {
+    Get-LogonDurationAnalysis -Username $Username -UserDomain  $Userdomain -CUDesktopLoadTime $args[1] -HDXSessionId $SessionId -ClientName $clientName
 }
-catch [System.Management.Automation.ParameterBindingException] {
-    Write-Error "Couldn't bind parameter exception, Maybe the session is in `"Disconnected`" State."
-}
-
