@@ -1103,8 +1103,13 @@ function Get-LogonDurationAnalysis {
             }
         }
         ## Get all security events that we will need so we can search this list rather than going to event log every time
-        [array]$securityEvents = @( Get-WinEvent -FilterHashtable @{LogName='Security';StartTime=$logon.LogonTime;EndTime=($logon.LogonTime.AddMinutes( 60 ));Id=4018,5018,4688,4689} )
+        [array]$securityEvents = @( Get-WinEvent -FilterHashtable @{LogName='Security';StartTime=$logon.LogonTime;EndTime=($logon.LogonTime.AddMinutes( 60 ));Id=4018,5018,4688,4689} -ErrorAction SilentlyContinue)
        
+        if( ! $securityEvents -or ! $securityEvents.Count )
+        {
+            Write-Warning "Failed to cache any relevant security event logs from $(Get-Date $logon.LogonTime -Format G) for 60 minutes"
+        }
+
         $networkStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$ProcessIdStart].value -eq $Logon.WinlogonPID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1 )
         if( $networkStartEvent )
         {
@@ -1514,24 +1519,29 @@ foreach ($line in $sessionInfo) {
 $args_fix = ($args[0] -split '\\')
 $UserName = $args_fix[1]
 $UserDomain = $args_fix[0]
-$SessionId = $args[2]
+$SessionId = $(if( $args.Count -ge 3) { $args[2] })
 $XDUsername = $null
 $XDPassword = $null
 
 $foundAllParameters = $false
 foreach ($session in $sessionArray) {
-    if ($session.Username -eq $args[0] -and $session.SessionId -eq $args[2] -and $session.ClientName -eq $args[4] -and $session.SessionName -eq $args[3] ) {
-        Write-Verbose "All session parameters found"
-        $SessionName = $args[3]
-        $ClientName = $args[4]
-        $foundAllParameters = $true
+    try {
+        if ($session.Username -eq $args[0] -and $session.SessionId -eq $args[2] -and $session.ClientName -eq $args[4] -and $session.SessionName -eq $args[3] ) {
+            Write-Verbose "All session parameters found"
+            $SessionName = $args[3]
+            $ClientName = $args[4]
+            $foundAllParameters = $true
+        }
+    }
+    catch {
+        ## not all parameters are required when run manually
     }
 }
 
 if (-not($foundAllParameters)) {
     Write-Verbose "Only partial parameters found"
     $UserTest = $args[0]
-    $count = ($sessionArray | Where-Object -FilterScript { $_.UserName -eq $UserTest }).Count
+    $count = $sessionArray | Where-Object -FilterScript { $_.UserName -eq $UserTest } | Select -ExpandProperty Count -ErrorAction SilentlyContinue
     Write-Verbose "Found $count number of sessions for $($args[0])"
     if ($count -eq 1) {
         $ClientName = ($sessionArray | Where-Object -FilterScript { $_.UserName -eq $UserTest }).ClientName
@@ -1543,7 +1553,7 @@ if (-not($foundAllParameters)) {
     }
 }
 
-if ($args[5] -and $args[6]) {
+if ( $args.Count -ge 7 -and $args[5] -and $args[6]) {
     $XDUsername = $args[5]
     $XDPassword = $args[6]
 }
@@ -1561,12 +1571,25 @@ Write-Debug "SessionName: $SessionName"
 Write-Debug "SessionId:   $SessionID"
 Write-Debug "XDUsername:  $XDUserName"
 
+[hashtable]$params = @{
+    'Username' = $Username
+    'UserDomain' =  $UserDomain
+    'ClientName' = $clientName
+}
+if( $args.Count -ge 2 -and $args[1] )
+{
+    $params.Add( 'CUDesktopLoadTime' , $args[1] )
+}
+
 if ($SessionName -imatch "RDP") {
-        Get-LogonDurationAnalysis -Username $Username -UserDomain  $UserDomain -CUDesktopLoadTime $args[1] -ClientName $clientName
+        Get-LogonDurationAnalysis @params 
     }
-elseif ($XDUsername -ne $null -and $XDPassword -ne $null) {
-    Get-LogonDurationAnalysis -Username $Username -UserDomain  $Userdomain -CUDesktopLoadTime $args[1] -HDXSessionId $SessionId `
-    -XDUsername $XDUsername -XDPassword (ConvertTo-SecureString "$XDPassword" -AsPlainText -Force) -ClientName $clientName
-} else {
-    Get-LogonDurationAnalysis -Username $Username -UserDomain  $Userdomain -CUDesktopLoadTime $args[1] -HDXSessionId $SessionId -ClientName $clientName
+else {
+    $params.Add( 'HDXSessionId' , $SessionId )
+
+    if ($XDUsername -and $XDPassword ) {
+        Get-LogonDurationAnalysis @params -XDUsername $XDUsername -XDPassword (ConvertTo-SecureString -String $XDPassword -AsPlainText -Force)
+    } else {
+        Get-LogonDurationAnalysis @params
+    }
 }
