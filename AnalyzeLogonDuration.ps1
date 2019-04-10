@@ -1,5 +1,5 @@
 ﻿ #requires -version 3.0
- 
+
 <#
  	.SYNOPSIS
         An advanced function that gives you a break-down analysis of a user's most recent logon on the machine.
@@ -53,10 +53,11 @@
 		Gets analysis of the logon process for the user 'Rick' in the current domain.
 #>
 
-## Last modified 1641 GMT 10/04/19 @guyrleech
+## Last modified 1646 GMT 18/03/19 @guyrleech
 
+[int]$suggestedSecurityEventLogSizeMB = 100
 [int]$outputWidth = 400
-$DebugPreference = 'Continue'
+$DebugPreference = 'SilentlyContinue'
 
 function Get-LogonDurationAnalysis {
     [CmdletBinding(DefaultParameterSetName="None")]
@@ -119,8 +120,7 @@ function Get-LogonDurationAnalysis {
                     {
                         if( $Matches[1] -notmatch 'Success' )
                         {
-                            $Matches
-                            $results += "Auditing of $policy success is not enabled which can cause problems with this SBA`n"
+                            $results += "Auditing of `"$policy success`" is not enabled which can cause problems with this SBA`n"
                         }
                     }
                     else
@@ -556,7 +556,7 @@ function Get-LogonDurationAnalysis {
             $End
             )
 
-            [array]$logontaskEvents = @( Get-WinEvent -FilterHashtable @{ProviderName='Microsoft-Windows-TaskScheduler';StartTime=$start;Id=119,201} )
+            [array]$logontaskEvents = @( Get-WinEvent -FilterHashtable @{ProviderName='Microsoft-Windows-TaskScheduler';StartTime=$start;Id=119,201} -ErrorAction SilentlyContinue)
 
             $logontaskEvents | Where-Object { $_.Id -eq 119 -and $_.TimeCreated -le $end -and $_.Properties[1].Value -eq "$UserDomain\$UserName" } | ForEach-Object `
             {
@@ -592,7 +592,6 @@ function Get-LogonDurationAnalysis {
             Write-Verbose "Get-PrinterEvents Start Time: $start"
             Write-Verbose "Get-PrinterEvents End Time: $end"
             Write-Verbose "Get-PrinterEvents ClientName: $ClientName"
-
 
             [string]$eventLogStatus = Get-EventLogEnabledStatus -eventLog 'Microsoft-Windows-PrintService/Operational'
             if( ! [string]::IsNullOrEmpty( $eventLogStatus ) )
@@ -740,7 +739,6 @@ function Get-LogonDurationAnalysis {
                 }
             }
 
-
             foreach ($printer in $listOfPrinters) {
                 $phaseName = "    Printer: $($printer.Name)"
                 Write-Verbose "Phase: $phaseName"
@@ -816,10 +814,11 @@ function Get-LogonDurationAnalysis {
         $jobs = New-Object System.Collections.ArrayList
         
         ## this gives us logon time from LSA which is definitive
-        Get-WmiObject win32_logonsession -Filter "LogonType='10' or LogonType='12'" | Sort StartTime -Desc | ForEach-Object `
+        Get-WmiObject win32_logonsession -Filter "LogonType='10' or LogonType='12' or LogonType='2' or LogonType='11'" | Sort StartTime -Desc | ForEach-Object `
         {
             $session = $_
-            if( ! $wmiEvent )
+ 
+            if( ! $wmiEvent -and $session.AuthenticationPackage -eq 'Kerberos' )
             {
                 Get-WmiObject win32_loggedonuser -filter "Dependent = '\\\\.\\root\\cimv2:Win32_LogonSession.LogonId=`"$($session.logonid)`"'" | ForEach-Object `
                 {
@@ -924,9 +923,9 @@ function Get-LogonDurationAnalysis {
                     ## 'Begin session arbitration' but happens before event id 21 'Remote Desktop Services: Session logon succeeded' so we must search around that time
                     $LSMEvent = Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-TerminalServices-LocalSessionManager -FilterXPath (
                         New-XPath -EventId 41 -UserData @{User="$UserDomain\$UserName"} `
-                        -ToDate $tsevent.TimeCreated.AddSeconds( 1 ) -encode `
+                        -ToDate $tsevent.TimeCreated -encode `
                         -FromDate (Get-Date $tsevent.TimeCreated).AddSeconds( -300 ) ) `
-                            -ErrorAction Continue -Verbose:$False
+                            -ErrorAction Stop -Verbose:$False
                 
                     if( $LSMEvent )
                     {
@@ -966,6 +965,7 @@ function Get-LogonDurationAnalysis {
 
             $jobs | ForEach-Object `
             {
+                $job = $_
                 try {
                     $result = $_.powershell.EndInvoke($_.handle)
                     if( $_.Name -eq 'LogonEvent' )
@@ -979,11 +979,16 @@ function Get-LogonDurationAnalysis {
                 }
                 catch
                 {
-                    Write-Warning "$($_.Name) : $_"
+                    Write-Error "Job $($job.Name) threw exception: $_"
                 }
                 $_.PowerShell.Dispose()
             }
             $jobs.clear()
+            if( ! $logonEvent )
+            {
+                $logonEvent = $UserLogon
+                $UserLogon = $null
+            }
         }
         else {
             try {
@@ -1019,15 +1024,33 @@ function Get-LogonDurationAnalysis {
         if( ! $LogonEvent )
         {
             [string]$exception = "Failed to find the logon event for $Username $(Get-UserLogonDetails $username)"    
-            $oldest = Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-Security-Auditing -Oldest
+            $oldest = Get-WinEvent -MaxEvents 1 -LogName 'Security' -Oldest   
             if( $oldest )
             {
                 $exception += "`nOldest security event is from $(Get-Date $oldest.TimeCreated -Format G)"
+                if( $oldest.Id -eq 1102 )
+                {
+                    $exception += ( " when {0} by {1}\{2}" -f ($oldest.Message -split "[\.`n]")[0].ToString().ToLower() , $oldest.Properties[2].Value , $oldest.Properties[1].Value )
+                }
             }
-            $securityEventLog = Get-WmiObject -Class Win32_NTEventLogFile -filter "LogFileName = 'security'" -ErrorAction SilentlyContinue
+            $securityEventLog = Get-WinEvent -ListLog 'Security'
             if( $securityEventLog )
             {
-                $exception += " event log maximum size is $([math]::Round($securityEventLog.MaxFileSize / 1MB , 1))MB"
+                [int]$sizeInMB = [math]::Round($securityEventLog.MaximumSizeInBytes / 1MB , 1)
+                $exception += "`nSecurity event log maximum size is $($sizeInMB)MB"
+                if( $sizeInMB -lt $suggestedSecurityEventLogSizeMB )
+                {
+                    $exception += ". You may want to increase this to at least $($suggestedSecurityEventLogSizeMB)MB"
+                }
+                if( $oldest )
+                {
+                    $newest = Get-WinEvent -MaxEvents 1 -LogName 'Security'
+                    if( $newest )
+                    {
+                        $timespan = New-TimeSpan -Start $oldest.TimeCreated -End $newest.TimeCreated
+                        $exception += ( "`nSecurity event log currently contains {0} records over {1} days so an average rate of {2} events logged per day`n" -f $securityEventLog.RecordCount , [Math]::Round( $timespan.TotalDays , 1 ) , [Math]::Round( $securityEventLog.RecordCount / $timespan.TotalDays , 1) )
+                    }
+                }
             }
             $exception += "`n$(Get-AuditSettings)"
 
@@ -1060,6 +1083,7 @@ function Get-LogonDurationAnalysis {
             $logon.FormatTime = '{0:HH:mm:ss.f}' -f $Logon.LogonTime ## show tenths of second since durations are displayed that way
         }
     }
+
     process {          
             [hashtable]$parameters = @{
                 'UserName' = $userName
@@ -1078,12 +1102,9 @@ function Get-LogonDurationAnalysis {
                 Write-Host "INFO: No credentials entered for the XenDesktop username/password fields"
             }
         }
-        ## Get all security events so we can see how many there are in a given time to show approx rate of entries
-        [array]$allSecurityEvents = @( Get-WinEvent -FilterHashtable @{LogName='Security'} )
         ## Get all security events that we will need so we can search this list rather than going to event log every time
-        [array]$securityEventsEvt = @( Get-WinEvent -FilterHashtable @{LogName='Security';StartTime=$logon.LogonTime;EndTime=($logon.LogonTime.AddMinutes( 60 ));Id=4018,5018,4688,4689} )
-        [array]$securityEvents = @( allSecurityEvents | Where-Object { $_.TimeCreated -ge $logon.LogonTime -and $_.TimeCreated -le $logon.LogonTime.AddMinutes( 60 ) -and $_.Id -in @( 4018,5018,4688,4689 ) } )
-
+        [array]$securityEvents = @( Get-WinEvent -FilterHashtable @{LogName='Security';StartTime=$logon.LogonTime;EndTime=($logon.LogonTime.AddMinutes( 60 ));Id=4018,5018,4688,4689} )
+       
         $networkStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$ProcessIdStart].value -eq $Logon.WinlogonPID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1 )
         if( $networkStartEvent )
         {
@@ -1236,8 +1257,11 @@ function Get-LogonDurationAnalysis {
         $jobs.clear()
 
         $Script:GPAsync = $sharedVars[ 'GPASync' ]
-        Write-Debug "Get-PrinterEvents -Start $($userinitStartEvent.TimeCreated) -End $(($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}).EndTime) -ClientName $ClientName"
-        Get-PrinterEvents -Start $userinitStartEvent.TimeCreated -End ($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}).EndTime -ClientName $ClientName
+        if( $userinitStartEvent )
+        {
+            Write-Debug "Get-PrinterEvents -Start $($userinitStartEvent.TimeCreated) -End $(($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}).EndTime) -ClientName $ClientName"
+            Get-PrinterEvents -Start $userinitStartEvent.TimeCreated -End ($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}).EndTime -ClientName $ClientName
+        }
 
         if (($Script:Output).Length -lt 2 ) {
             $PSCmdlet.WriteWarning("Not enough data for that session, Aborting function...")
