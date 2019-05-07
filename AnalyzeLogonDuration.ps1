@@ -1,4 +1,5 @@
-﻿ #requires -version 3.0
+﻿#Requires -version 3
+#Requires -RunAsAdministrator
 
 <#
  	.SYNOPSIS
@@ -53,11 +54,189 @@
 		Gets analysis of the logon process for the user 'Rick' in the current domain.
 #>
 
-## Last modified 1646 GMT 18/03/19 @guyrleech
+## Last modified 1345 GMT 07/05/19 @guyrleech
 
+## A mechanism to allow script use offline with saved event logs
+[hashtable]$global:terminalServicesParams = @{ 'ProviderName' = 'Microsoft-Windows-TerminalServices-LocalSessionManager' }
+[hashtable]$global:securityParams = @{ 'ProviderName' = 'Microsoft-Windows-Security-Auditing' }
+[hashtable]$global:userProfileParams = @{ 'ProviderName' = 'Microsoft-Windows-User Profile Service' }
+[hashtable]$global:groupPolicyParams = @{ 'ProviderName' = 'Microsoft-Windows-GroupPolicy' }
+[hashtable]$global:scheduledTasksParams = @{ 'ProviderName' = 'Microsoft-Windows-TaskScheduler' }
+[hashtable]$global:citrixUPMParams = @{ 'ProviderName' = 'Citrix Profile Management' }
+[hashtable]$global:printServiceParams = @{ 'ProviderName' = 'Microsoft-Windows-PrintService' }
+[int]$global:windowsMajorVersion = [System.Environment]::OSVersion.Version.Major
+[bool]$offline = $false
 [int]$suggestedSecurityEventLogSizeMB = 100
 [int]$outputWidth = 400
 $DebugPreference = 'SilentlyContinue'
+          
+$AuditDefinitions = @'
+
+    /// <summary>
+    /// The AuditFree function frees the memory allocated by audit functions for the specified buffer.
+    /// </summary>
+    /// <param name="buffer">A pointer to the buffer to free.</param>
+    /// <remarks>https://msdn.microsoft.com/en-us/library/windows/desktop/aa375654(v=vs.85).aspx</remarks>
+    [DllImport("advapi32.dll")]
+    public static extern void AuditFree(IntPtr buffer);
+
+
+    /// <summary>
+    /// The AuditQuerySystemPolicy function retrieves system audit policy for one or more audit-policy subcategories.
+    /// </summary>
+    /// <param name="pSubCategoryGuids">A pointer to an array of GUID values that specify the subcategories for which to query audit policy. </param>
+    /// <param name="PolicyCount">The number of elements in each of the pSubCategoryGuids and ppAuditPolicy arrays.</param>
+    /// <param name="ppAuditPolicy">A pointer to a single buffer that contains both an array of pointers to AUDIT_POLICY_INFORMATION structures and the structures themselves. </param>
+    /// <returns>https://msdn.microsoft.com/en-us/library/windows/desktop/aa375702(v=vs.85).aspx</returns>
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool AuditQuerySystemPolicy(Guid pSubCategoryGuids, uint PolicyCount, out IntPtr ppAuditPolicy);
+        
+
+    /// <summary>
+    /// The AuditQuerySystemPolicy function retrieves system audit policy for one or more audit-policy subcategories.
+    /// </summary>
+    /// <param name="pSubCategoryGuids">A pointer to an array of GUID values that specify the subcategories for which to query audit policy. </param>
+    /// <param name="PolicyCount">The number of elements in each of the pSubCategoryGuids and ppAuditPolicy arrays.</param>
+    /// <param name="ppAuditPolicy">A pointer to a single buffer that contains both an array of pointers to AUDIT_POLICY_INFORMATION structures and the structures themselves. </param>
+    /// <returns>https://msdn.microsoft.com/en-us/library/windows/desktop/aa375702(v=vs.85).aspx</returns>
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool AuditSetSystemPolicy( IntPtr ppAuditPolicy , uint PolicyCount);
+
+    /// <summary>
+    /// The AUDIT_POLICY_INFORMATION structure specifies a security event type and when to audit that type.
+    /// </summary>
+    /// <remarks>https://msdn.microsoft.com/en-us/library/windows/desktop/aa965467(v=vs.85).aspx</remarks>
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct AUDIT_POLICY_INFORMATION
+    {
+
+        /// <summary>
+        /// A GUID structure that specifies an audit subcategory.
+        /// </summary>
+        public Guid AuditSubCategoryGuid;
+
+        /// <summary>
+        /// A set of bit flags that specify the conditions under which the security event type specified by the AuditSubCategoryGuid and AuditCategoryGuid members are audited.
+        /// </summary>
+        public AUDIT_POLICY_INFORMATION_TYPE AuditingInformation;
+
+        /// <summary>
+        /// A GUID structure that specifies an audit-policy category.
+        /// </summary>
+        public Guid AuditCategoryGuid;
+
+    }
+
+    /// <summary>
+    /// Represents the auditing type.
+    /// </summary>
+    [Flags]
+    public enum AUDIT_POLICY_INFORMATION_TYPE
+    {
+
+        /// <summary>
+        /// Do not audit the specified event type.
+        /// </summary>
+        None = 0,
+
+        /// <summary>
+        /// Audit successful occurrences of the specified event type.
+        /// </summary>
+        Success = 1,
+
+        /// <summary>
+        /// Audit failed attempts to cause the specified event type.
+        /// </summary>
+        Failure = 2,
+    }
+'@
+
+Function Get-SystemPolicy( [Guid]$subCategoryGuid)
+{
+    $buffer = [IntPtr]::Zero
+    if ([Win32.Advapi32]::AuditQuerySystemPolicy( $subCategoryGuid , 1 , [ref]$buffer) -and $buffer -ne [IntPtr]::Zero )
+    {
+        [System.Runtime.InteropServices.Marshal]::PtrToStructure( [System.IntPtr]$buffer , [type][Win32.Advapi32+AUDIT_POLICY_INFORMATION] ) ## return
+        [Win32.Advapi32]::AuditFree($buffer)
+        $buffer = [IntPtr]::Zero
+    }
+}
+        
+Function Set-SystemPolicy( [Guid]$subCategoryGuid , [Guid]$categoryGuid  )
+{
+    [bool]$result = $false
+    if( ! ( ([System.Management.Automation.PSTypeName]'Win32.Advapi32').Type ) )
+    {
+        [void](Add-Type -MemberDefinition $AuditDefinitions -Name 'Advapi32' -Namespace 'Win32' -UsingNamespace System.Text -Debug:$false)
+    }
+    $policy = New-Object -TypeName 'Win32.Advapi32+AUDIT_POLICY_INFORMATION'
+    [IntPtr]$buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal( [System.Runtime.InteropServices.Marshal]::SizeOf( [type][Win32.Advapi32+AUDIT_POLICY_INFORMATION] ) )
+    if( $buffer -ne [IntPtr]::Zero )
+    {
+        ##[Win32.Advapi32+AUDIT_POLICY_INFORMATION]$policyEntry = [System.Runtime.InteropServices.Marshal]::PtrToStructure( $buffer ,[type]$policy.GetType())
+        $policy.AuditSubCategoryGuid = $subCategoryGuid
+        $policy.AuditCategoryGuid = $categoryGuid
+        $policy.AuditingInformation = [Win32.Advapi32+AUDIT_POLICY_INFORMATION_TYPE]::Success
+        [IntPtr]$ptr = [IntPtr]::Zero
+        $marshalResult = [System.Runtime.InteropServices.Marshal]::StructureToPtr( $policy , $buffer , $false )
+        $result = [Win32.Advapi32]::AuditSetSystemPolicy( $buffer , [uint64]1 );$LastError = [ComponentModel.Win32Exception][Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if( ! $result )
+        {
+            Write-Warning "AuditSetSystemPolicy failed - $LastError"
+        }
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal( $buffer )
+        $buffer = [IntPtr]::Zero
+    }
+    else
+    {
+        Write-Warning "Failed to allocate memory for audit buffer"
+    }
+    $result ## return
+}
+
+Function Test-AuditSetting( [string]$GUID , [string]$name , [ref]$setting )
+{
+    $auditEvent = Get-SystemPolicy -subCategoryGuid $GUID
+    if( $auditEvent )
+    {
+        $setting.Value = $auditEvent.AuditingInformation.ToString()
+        ( $auditEvent.AuditingInformation -band [Win32.Advapi32+AUDIT_POLICY_INFORMATION_TYPE]::Success ) -eq [Win32.Advapi32+AUDIT_POLICY_INFORMATION_TYPE]::Success 
+    }
+    else
+    {
+        Write-Warning "Could not get setting for `"$name`" with GUID $GUID"
+    }
+}
+
+Function Test-AuditSettings
+{
+    [CmdletBinding()]
+              
+    [hashtable]$requiredAuditEvents = @{
+        'Process Creation'    = '0cce922b-69ae-11d9-bed3-505054503030'
+        'Process Termination' = '0cce922c-69ae-11d9-bed3-505054503030'
+        'Logon'               = '0cce9215-69ae-11d9-bed3-505054503030'
+    }
+
+    [string]$resultString = $null
+            
+    if( ! ( ([System.Management.Automation.PSTypeName]'Win32.Advapi32').Type ) )
+    {
+        [void](Add-Type -MemberDefinition $AuditDefinitions -Name 'Advapi32' -Namespace 'Win32' -UsingNamespace System.Text -Debug:$false)
+    }
+    [string]$newline = $null
+    [string]$setting = $null
+    ForEach( $requiredAuditEvent in ($requiredAuditEvents.GetEnumerator() ))
+    {
+        $result = Test-AuditSetting -GUID $requiredAuditEvent.Value -name $requiredAuditEvent.Name -setting ([ref]$setting)
+        if( $result -eq $null -or $result -eq $false )
+        {
+            $resultString += "$($newline)Auditing of `"$($requiredAuditEvent.Name)`" is not set to at least `"Success`" as required, it is set to `"$setting`""
+            $newline = "`n"
+        }
+    }
+    $resultString
+}
 
 function Get-LogonDurationAnalysis {
     [CmdletBinding(DefaultParameterSetName="None")]
@@ -100,42 +279,6 @@ function Get-LogonDurationAnalysis {
         $Script:Output = @()
         $Script:LogonStartDate = $null
 
-        # retrieve audit settings so we can report on them in case of failure
-        function Get-AuditSettings {
-            [CmdletBinding()]
-            Param(
-                [string[]]$policiesToReport = @( 'Process Creation' , 'Process Termination' , 'Logon' )
-            )
-
-            [string]$results = $null
-
-            [string[]]$auditPolicies = auditpol.exe /get /category:*
-
-            if( $auditPolicies -and $auditPolicies.Count )
-            {
-                ForEach( $policy in $policiesToReport )
-                {
-                    $thisPolicy = $auditPolicies | Where-Object { $_.Trim() -match "^$policy\s+(.*)$" }
-                    if( $thisPolicy )
-                    {
-                        if( $Matches[1] -notmatch 'Success' )
-                        {
-                            $results += "Auditing of `"$policy success`" is not enabled which can cause problems with this SBA`n"
-                        }
-                    }
-                    else
-                    {
-                        $results += "Failed to retrieve setting of audit policy $policy which if not enabled can cause problems with this SBA`n"
-                    }
-                }
-            }
-            else
-            {
-                $results = "Failed to retrieve audit settings via auditpol.exe"
-            }
-            $results
-        }
-
         ## array indexes for event log property fields to make retrieval more meaningful
         ## Event id 4688 (process start)
   
@@ -145,21 +288,25 @@ function Get-LogonDurationAnalysis {
         Set-Variable -Name ProcessIdNew      -Value 4  -Option ReadOnly
         Set-Variable -Name NewProcessName    -Value 5  -Option ReadOnly
         Set-Variable -Name ProcessIdStart    -Value 7  -Option ReadOnly
+        Set-Variable -Name TargetUserName    -Value 10 -Option ReadOnly
+        Set-Variable -Name TargetDomainName  -Value 11 -Option ReadOnly
         Set-Variable -Name TargetLogonId     -Value 12 -Option ReadOnly
         Set-Variable -Name ParentProcessName -Value 13 -Option ReadOnly
         
+        [string]$auditingWarning = Test-AuditSettings
         [bool]$SearchCommandLine = $false
-        if ([version](Get-CimInstance Win32_OperatingSystem).version -gt ([version]6.1)) { #are we using a version of Windows newer than Windows 2008R2/Windows 7?
+        if ([version](Get-CimInstance Win32_OperatingSystem).version -gt ([version]6.1)) { # are we using a version of Windows newer than Windows 2008R2/Windows 7 as not implemented prior to that?
             if (Test-Path -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -ErrorAction SilentlyContinue) {
                 $commandLinePolicy = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name 'ProcessCreationIncludeCmdLine_Enabled' -ErrorAction SilentlyContinue
-                if ($commandLinePolicy.ProcessCreationIncludeCmdLine_Enabled -eq 1) {
-                    if (-not($(Get-AuditSettings) -like "*Process Termination*")) { #need process termination auditing enabled or else we can't find when the process finishes
+                if ($commandLinePolicy -and $commandLinePolicy.ProcessCreationIncludeCmdLine_Enabled -eq 1) {
+                    if (-not($auditingWarning -like "*Process Termination*")) { #need process termination auditing enabled or else we can't find when the process finishes
                         Set-Variable -Name CommandLine -Value 8 -Option ReadOnly
                         $SearchCommandLine = $true
                     }
                 }
             }
         }
+        Write-Debug "Process command line auditing enabled is $SearchCommandLine"
         
         ## Event id 4689 (process stop)
         Set-Variable -Name ProcessIdStop  -Value 5 -Option ReadOnly
@@ -338,6 +485,14 @@ function Get-LogonDurationAnalysis {
         function Get-PhaseEvent {
             [CmdletBinding(DefaultParameterSetName="None")]
             param (
+                [AllowNull()]
+                [String]
+                $StartEventFile ,
+                
+                [AllowNull()]
+                [String]
+                $EndEventFile ,
+
                 [ValidateNotNullOrEmpty()]
                 [String]
                 $PhaseName,
@@ -374,23 +529,26 @@ function Get-LogonDurationAnalysis {
             )
             [datetime]$started = Get-Date
 
+            [hashtable]$startParams = if( $PSBoundParameters[ 'StartEventFile' ] ) { @{ 'Path' = $StartEventFile } } else { @{ 'ProviderName' = $StartProvider } }
+            [hashtable]$endParams = if( $PSBoundParameters[ 'EndEventFile' ] ) { @{ 'Path' = $EndEventFile } } else { @{ 'ProviderName' = $EndProvider } }
+
             try {
                 $PSCmdlet.WriteVerbose("Looking $PhaseName Events")
                 if(!$StartEvent) {
-                    $StartEvent = Get-WinEvent -MaxEvents 1 -ProviderName $StartProvider -FilterXPath $StartXPath -ErrorAction Stop -Verbose:$False
+                    $StartEvent = Get-WinEvent -MaxEvents 1 @startParams -FilterXPath $StartXPath -ErrorAction Stop -Verbose:$False
                 }
                 if (!$EndEvent) {
                     if ($StartProvider -eq 'Microsoft-Windows-Security-Auditing' -and $EndProvider -eq 'Microsoft-Windows-Security-Auditing') {
-                        $EndEvent = Get-WinEvent -MaxEvents 1 -ProviderName $EndProvider -FilterXPath ("{0}{1}" -f $EndXPath,(
-                        "and *[EventData[Data[@Name='ProcessId']" +
-                        "and (Data=`'$($StartEvent.Properties[4].Value)`')]]")
-                        ) -ErrorAction Stop # Responsible to match the process termination event to the exact process
+                        $EndEvent = Get-WinEvent -MaxEvents 1 @endParams -FilterXPath ("{0}{1}" -f $EndXPath,(
+                            "and *[EventData[Data[@Name='ProcessId']" +
+                            "and (Data=`'$($StartEvent.Properties[4].Value)`')]]")
+                            ) -ErrorAction Stop # Responsible to match the process termination event to the exact process
                     }
                     elseif ($CUAddition) {
                         [DateTime]$EndEvent = $StartEvent.TimeCreated.AddSeconds($CUAddition)
                     }
                     else {
-                        $EndEvent = Get-WinEvent -MaxEvents 1 -ProviderName $EndProvider -FilterXPath $EndXPath 
+                        $EndEvent = Get-WinEvent -MaxEvents 1 @endParams -FilterXPath $EndXPath 
                     }
                 }
             }
@@ -477,6 +635,7 @@ function Get-LogonDurationAnalysis {
 	        }
 
             try {
+                Write-Debug "Checking session $sessionKey on DDC $DDC as user $XDUsername"
                 $XDCreds = New-Object System.Management.Automation.PSCredential ($XDUsername, $XDPassword)
 	            $ODataData = (Invoke-RestMethod -Uri "http://$DDC/Citrix/Monitor/OData/v1/Data/Sessions(guid'$SessionKey')/CurrentConnection" `
                    -Credential $XDCreds ).entry.content.properties
@@ -556,7 +715,10 @@ function Get-LogonDurationAnalysis {
             $End
             )
 
-            [array]$logontaskEvents = @( Get-WinEvent -FilterHashtable @{ProviderName='Microsoft-Windows-TaskScheduler';StartTime=$start;Id=119,201} -ErrorAction SilentlyContinue)
+            [hashtable]$logonTaskParams = $global:scheduledTasksParams.Clone()
+            $logonTaskParams.Add( 'StartTime' , $start )
+            $logonTaskParams.Add( 'Id' , @(119,201) )
+            [array]$logontaskEvents = @( Get-WinEvent -FilterHashtable $logonTaskParams -ErrorAction SilentlyContinue)
 
             $logontaskEvents | Where-Object { $_.Id -eq 119 -and $_.TimeCreated -le $end -and $_.Properties[1].Value -eq "$UserDomain\$UserName" } | ForEach-Object `
             {
@@ -593,11 +755,14 @@ function Get-LogonDurationAnalysis {
             Write-Verbose "Get-PrinterEvents End Time: $end"
             Write-Verbose "Get-PrinterEvents ClientName: $ClientName"
 
-            [string]$eventLogStatus = Get-EventLogEnabledStatus -eventLog 'Microsoft-Windows-PrintService/Operational'
-            if( ! [string]::IsNullOrEmpty( $eventLogStatus ) )
+            if( ! $offline )
             {
-                $PSCmdlet.WriteWarning( $eventLogStatus )
-                return
+                [string]$eventLogStatus = Get-EventLogEnabledStatus -eventLog 'Microsoft-Windows-PrintService/Operational'
+                if( ! [string]::IsNullOrEmpty( $eventLogStatus ) )
+                {
+                    $PSCmdlet.WriteWarning( $eventLogStatus )
+                    return
+                }
             }
 
             if( [string]::IsNullOrEmpty( $End ) )
@@ -628,7 +793,8 @@ function Get-LogonDurationAnalysis {
                 }
     
             }
-            [array]$printerTaskEvents = @( Get-WinEvent -FilterHashtable @{ProviderName='Microsoft-Windows-PrintService';StartTime=$start;EndTime=$end;Id=300,306} -ErrorAction SilentlyContinue )
+            [hashtable]$printerParams = $global:printServiceParams.Clone() +  @{ StartTime = $start ; EndTime = $end ; Id = 300,306}
+            [array]$printerTaskEvents = @( Get-WinEvent -FilterHashtable $printerParams -ErrorAction SilentlyContinue )
             if ($printerTaskEvents.count -eq 0) {
                 #no printer events found.  This may occur if the application is not set to wait for printers (totally normal!) so just return without a message
                 Write-Verbose "No Printer Events Found."
@@ -775,15 +941,22 @@ function Get-LogonDurationAnalysis {
             }
 
             #capture the totality of the printer mapping sequence.
-            $Duration = New-TimeSpan -Start $($AllPrinterEvents.StartTime | sort -Descending)[-1] -End $($AllPrinterEvents.EndTime | sort -Descending)[0]
-            $EventInfo = @{}
-            $EventInfo.PhaseName = "  Connect to Printers"
-            $EventInfo.Duration = $Duration.TotalSeconds
-            $EventInfo.EndTime = ($AllPrinterEvents.EndTime | sort -Descending)[0]
-            $EventInfo.StartTime = (($AllPrinterEvents.StartTime | sort -Descending)[-1]).AddMilliseconds(-10) #we subtract 5 milliseconds so the order sorts correctly
-            $PSObject = New-Object -TypeName PSObject -Property $EventInfo
-            if ($EventInfo.Duration) {
-                    $Script:Output += $PSObject
+            if( $AllPrinterEvents -and $AllPrinterEvents.Count )
+            {
+                $Duration = New-TimeSpan -Start $($AllPrinterEvents.StartTime | sort -Descending)[-1] -End $($AllPrinterEvents.EndTime | sort -Descending)[0]
+                $EventInfo = @{}
+                $EventInfo.PhaseName = "  Connect to Printers"
+                $EventInfo.Duration = $Duration.TotalSeconds
+                $EventInfo.EndTime = ($AllPrinterEvents.EndTime | sort -Descending)[0]
+                $EventInfo.StartTime = (($AllPrinterEvents.StartTime | sort -Descending)[-1]).AddMilliseconds(-10) #we subtract 5 milliseconds so the order sorts correctly
+                $PSObject = New-Object -TypeName PSObject -Property $EventInfo
+                if ($EventInfo.Duration) {
+                        $Script:Output += $PSObject
+                }
+            }
+            else
+            {
+                Write-Debug "No printer events found for client $ClientName"
             }
         }
 
@@ -810,36 +983,50 @@ function Get-LogonDurationAnalysis {
         $RunspacePool.Open()
         $tsevent = $null
         $logonEvent = $null
+        $UserLogon = $null
         $wmiEvent = $null
         $jobs = New-Object System.Collections.ArrayList
         
-        ## this gives us logon time from LSA which is definitive
-        Get-WmiObject win32_logonsession -Filter "LogonType='10' or LogonType='12' or LogonType='2' or LogonType='11'" | Sort StartTime -Desc | ForEach-Object `
+        if( ! $offline )
         {
-            $session = $_
- 
-            if( ! $wmiEvent -and $session.AuthenticationPackage -eq 'Kerberos' )
+            $OS = Get-WmiObject -Class win32_operatingsystem -ErrorAction SilentlyContinue
+            $CS = Get-WmiObject -Class win32_computersystem -ErrorAction SilentlyContinue
+            if( $OS )
             {
-                Get-WmiObject win32_loggedonuser -filter "Dependent = '\\\\.\\root\\cimv2:Win32_LogonSession.LogonId=`"$($session.logonid)`"'" | ForEach-Object `
+                Write-Debug "OS is $($OS.Caption) $($OS.Version)"
+            }
+            if( $CS )
+            {
+                Write-Debug "Manufacturer $($CS.Manufacturer) model $($CS.Model), name $($CS.Name) domain $($CS.Domain) virtual $($CS.HypervisorPresent)"
+            }
+            ## this gives us logon time from LSA which is definitive
+            Get-WmiObject win32_logonsession -Filter "LogonType='10' or LogonType='12' or LogonType='2' or LogonType='11'" | Sort StartTime -Desc | ForEach-Object `
+            {
+                $session = $_
+ 
+                if( ! $wmiEvent -and $session.AuthenticationPackage -eq 'Kerberos' )
                 {
-                    if( ! $wmiEvent -and $_.Antecedent -match 'Domain="(.*)",Name="(.*)"$' `
-                        -and $matches -and $matches.Count -eq 3 -and $UserDomain -eq $matches[1] -and $userName -eq $matches[2] )
+                    Get-WmiObject win32_loggedonuser -filter "Dependent = '\\\\.\\root\\cimv2:Win32_LogonSession.LogonId=`"$($session.logonid)`"'" | ForEach-Object `
                     {
-                        $wmiEvent = [pscustomobject]@{ 'LogonTime' = (([WMI] '').ConvertToDateTime( $session.StartTime )) ; 'LogonType' = $session.LogonType ; 'LogonId' = $session.LogonId }
+                        if( ! $wmiEvent -and $_.Antecedent -match 'Domain="(.*)",Name="(.*)"$' `
+                            -and $matches -and $matches.Count -eq 3 -and $UserDomain -eq $matches[1] -and $userName -eq $matches[2] )
+                        {
+                            $wmiEvent = [pscustomobject]@{ 'LogonTime' = (([WMI] '').ConvertToDateTime( $session.StartTime )) ; 'LogonType' = $session.LogonType ; 'LogonId' = $session.LogonId }
+                        }
                     }
                 }
             }
-        }
         
-        if( ! $wmiEvent )
-        {
-            ## Not fatal as we will fallback to other methods
-            Write-Warning "Could not find win32_logonsession/win32_loggedonuser object for $UserDomain\$Username"
+            if( ! $wmiEvent )
+            {
+                ## Not fatal as we will fallback to other methods
+                Write-Warning "Could not find win32_logonsession/win32_loggedonuser object for $UserDomain\$Username"
+            }
         }
 
         try {
             ## Security event on its own happens on reconnect too so we use this log to find session so security event will be before this
-            $tsevent = Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-TerminalServices-LocalSessionManager -FilterXPath (
+            $tsevent = Get-WinEvent -MaxEvents 1 @global:terminalServicesParams  -FilterXPath (
                 New-XPath -EventId 21 `
                 -UserData @{
                     User="$UserDomain\$UserName"
@@ -867,16 +1054,19 @@ function Get-LogonDurationAnalysis {
             Throw $exceptionString
         }
 
-        if ([System.Environment]::OSVersion.Version.Major -ge 10) {
+        if ($global:windowsMajorVersion -ge 10) {
             [hashtable]$parameters = @{
                 'UserName' = $userName
                 'UserDomain' = $UserDomain
                 'TSevent' = $tsevent
+                'securityEventSource' = $global:securityParams
+                'tsEventSource' = $global:terminalServicesParams
+                'EncodeXpath' = ! $offline ## for reasons as yet unknown Microsoft-Windows-TerminalServices-LocalSessionManager log needs >= & <= encoding unlike all other logs but only when online
                 }                
             $PowerShell = [PowerShell]::Create() 
             $PowerShell.RunspacePool = $RunspacePool
             [void]$PowerShell.AddScript({
-                Param( $userName , $userDomain , $tsevent )
+                Param( $userName , $userDomain , $tsevent , [hashtable]$securityEventSource , [hashtable]$tsEventSource )
                 try {
                     [hashtable]$eventData = @{
                                 TargetUserName=$UserName
@@ -888,7 +1078,7 @@ function Get-LogonDurationAnalysis {
                     {
                         $eventData.Add( 'TargetLogonId' , $wmiEvent.LogonId )
                     }
-                    Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-Security-Auditing -FilterXPath (
+                    Get-WinEvent -MaxEvents 1 @securityEventSource -FilterXPath (
                             New-XPath -EventId 4624 `
                             -ToDate $tsevent.TimeCreated `
                             -FromDate (Get-Date $tsevent.TimeCreated).AddSeconds( -300 ) `
@@ -898,15 +1088,18 @@ function Get-LogonDurationAnalysis {
                     Throw 'Unauthorized Operation, Please run the script with administrative privileges.'
                 }
                 catch {
-                    $oldest = Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-Security-Auditing -Oldest -ErrorAction SilentlyContinue
+                    $oldest = Get-WinEvent -MaxEvents 1 @securityEventSource -Oldest -ErrorAction SilentlyContinue
                     [string]$info = "Could not find EventID 4624 (Successfully logged on event) in the Windows Security log"
                     if( $oldest )
                     {
                         $info += " - oldest event is from $(Get-Date $oldest.TimeCreated -Format G)"
                     }
                     $info += Get-UserLogonDetails $Username
-                    $info += "`n$(Get-AuditSettings)"
-
+                    if( $auditingWarning )
+                    {
+                        $info += "`n$auditingWarning"
+                        $auditingWarning = $null ## stop multiple occurrences
+                    }
                     Throw $info
                 }
             })
@@ -918,22 +1111,22 @@ function Get-LogonDurationAnalysis {
             $PowerShell = [PowerShell]::Create() 
             $PowerShell.RunspacePool = $RunspacePool
             [void]$PowerShell.AddScript({
-                Param( $userName , $userDomain , $tsevent )
+                Param( $userName , $userDomain , $tsevent , [hashtable]$securityEventSource , [hashtable]$tsEventSource , $encodeXPath )
                 try {
                     ## 'Begin session arbitration' but happens before event id 21 'Remote Desktop Services: Session logon succeeded' so we must search around that time
-                    $LSMEvent = Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-TerminalServices-LocalSessionManager -FilterXPath (
+                    $LSMEvent = Get-WinEvent -MaxEvents 1 @tsEventSource -FilterXPath (
                         New-XPath -EventId 41 -UserData @{User="$UserDomain\$UserName"} `
-                        -ToDate $tsevent.TimeCreated -encode `
+                        -ToDate $tsevent.TimeCreated -encode:$encodeXPath `
                         -FromDate (Get-Date $tsevent.TimeCreated).AddSeconds( -300 ) ) `
                             -ErrorAction Stop -Verbose:$False
-                
+
                     if( $LSMEvent )
                     {
                         $SessionId = $LSMEvent.Properties[1].Value
                 
                         if( ! [string]::IsNullOrEmpty( $SessionId ) )
                         {
-                            Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-Security-Auditing -FilterXPath (
+                            Get-WinEvent -MaxEvents 1 @securityEventSource -FilterXPath (
                                 New-XPath -EventId 4624 `
                                 -ToDate $tsevent.TimeCreated `
                                 -FromDate (Get-Date $tsevent.TimeCreated).AddSeconds( -300 ) `
@@ -979,7 +1172,7 @@ function Get-LogonDurationAnalysis {
                 }
                 catch
                 {
-                    Write-Error "Job $($job.Name) threw exception: $_"
+                    Write-Debug "Job $($job.Name) threw exception: $_"
                 }
                 $_.PowerShell.Dispose()
             }
@@ -992,7 +1185,7 @@ function Get-LogonDurationAnalysis {
         }
         else {
             try {
-                $LogonEvent = Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-Security-Auditing -FilterXPath (
+                $LogonEvent = Get-WinEvent -MaxEvents 1 @securityParams -FilterXPath (
                 New-XPath -EventId 4624 `
                     -ToDate $tsevent.TimeCreated `
                     -FromDate (Get-Date $tsevent.TimeCreated).AddSeconds( -300 ) `
@@ -1007,7 +1200,7 @@ function Get-LogonDurationAnalysis {
                 Throw 'Unauthorized Operation, Please run the script with administrative privileges.'
             }
             catch {
-                $oldest = Get-WinEvent -MaxEvents 1 -ProviderName Microsoft-Windows-Security-Auditing -Oldest
+                $oldest = Get-WinEvent -MaxEvents 1 @securityParams -Oldest
 
                 [string]$info = "Could not find EventID 4624 (Successfully logged on event) in the Windows Security log"
                 if( $oldest )
@@ -1015,7 +1208,12 @@ function Get-LogonDurationAnalysis {
                     $info += " - oldest event is from $(Get-Date $oldest.TimeCreated -Format G)"
                 }
                 $info += Get-UserLogonDetails $Username
-                $info += "`n$(Get-AuditSettings)"
+                
+                if( $auditingWarning )
+                {
+                    $info += "`n$auditingWarning"
+                    $auditingWarning = $null ## stop multiple occurrences
+                }
 
                 Throw $info
             }
@@ -1023,8 +1221,9 @@ function Get-LogonDurationAnalysis {
 
         if( ! $LogonEvent )
         {
-            [string]$exception = "Failed to find the logon event for $Username $(Get-UserLogonDetails $username)"    
-            $oldest = Get-WinEvent -MaxEvents 1 -LogName 'Security' -Oldest   
+            [string]$exception = "Failed to find the logon event for $Username $(Get-UserLogonDetails $username)"
+            [hashtable]$params =  if( $offline ) { $securityParams } else { @{ 'LogName' = 'Security' } }
+            $oldest = Get-WinEvent -MaxEvents 1 @params -Oldest   
             if( $oldest )
             {
                 $exception += "`nOldest security event is from $(Get-Date $oldest.TimeCreated -Format G)"
@@ -1052,7 +1251,12 @@ function Get-LogonDurationAnalysis {
                     }
                 }
             }
-            $exception += "`n$(Get-AuditSettings)"
+            
+            if( $auditingWarning )
+            {
+                $exception += "`n$auditingWarning"
+                $auditingWarning = $null ## stop multiple occurrences
+            }
 
             Throw $exception
         }
@@ -1082,6 +1286,7 @@ function Get-LogonDurationAnalysis {
             $Logon.LogonTime = $wmiEvent.LogonTime
             $logon.FormatTime = '{0:HH:mm:ss.f}' -f $Logon.LogonTime ## show tenths of second since durations are displayed that way
         }
+        Write-Debug "Logon data: $Logon"
     }
 
     process {          
@@ -1090,115 +1295,246 @@ function Get-LogonDurationAnalysis {
                 'UserDomain' = $UserDomain
                 'Logon' = $logon
                 'SharedVars' = $sharedVars
+                'UserProfileEventFile' = $global:userProfileParams[ 'Path' ]
+                'GroupPolicyEventFile' = $global:groupPolicyParams[ 'Path' ]
+                'CitrixUPMEventFile'   = $global:citrixUPMParams[ 'Path' ]
              }
 
         # If the machine is a Citrix VDA and a Session ID is provided, look for "HDX Connection" Phase
         $odataPhase = $null
-        if ((Get-Service -Name BrokerAgent -ErrorAction SilentlyContinue) -and ($HDXSessionId)) {
-            if ($XDUsername -and $XDPassword) {
-                $odataPhase = Get-ODataPhase
-            }
-            else {
-                Write-Host "INFO: No credentials entered for the XenDesktop username/password fields"
+        if( $offline )
+        {
+            Write-Debug "Skipping HDX check as in offline mode"
+        }
+        else
+        {
+            if ((Get-Service -Name BrokerAgent -ErrorAction SilentlyContinue) -and ($HDXSessionId)  ) {
+                if ($XDUsername -and $XDPassword) {
+                    $odataPhase = Get-ODataPhase
+                }
+                else {
+                    Write-Host "INFO: No credentials entered for the XenDesktop username/password fields"
+                }
             }
         }
-        ## Get all security events that we will need so we can search this list rather than going to event log every time
-        [array]$securityEvents = @( Get-WinEvent -FilterHashtable @{LogName='Security';StartTime=$logon.LogonTime;EndTime=($logon.LogonTime.AddMinutes( 60 ));Id=4018,5018,4688,4689} -ErrorAction SilentlyContinue)
-       
+        [hashtable]$securityFilter = @{StartTime=$logon.LogonTime;EndTime=($logon.LogonTime.AddMinutes( 60 ));Id=4018,5018,4688,4689}
+        if( $securityParams[ 'Path' ] )
+        {
+            $securityFilter.Add( 'Path' , $securityParams[ 'Path' ] )
+        }
+        else
+        {
+            $securityFilter.Add( 'LogName' , 'Security' )
+        }
+        [array]$securityEvents = @( Get-WinEvent -FilterHashtable $securityFilter -ErrorAction SilentlyContinue)
         if( ! $securityEvents -or ! $securityEvents.Count )
         {
             Write-Warning "Failed to cache any relevant security event logs from $(Get-Date $logon.LogonTime -Format G) for 60 minutes"
         }
 
-        $networkStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$ProcessIdStart].value -eq $Logon.WinlogonPID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1 )
-        if( $networkStartEvent )
+        ## only seem to get this when RDS role is installed (Multi-user Win10 or Server OS)
+        if( ! $offline -and (Test-Path -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server\Compatibility' -ErrorAction SilentlyContinue) )
         {
-            $Script:Output += Get-PhaseEventFromCache -PhaseName 'Network Providers' `
-                -startEvent $networkStartEvent `
-                -endEvent ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.TimeCreated -ge $networkStartEvent.TimeCreated -and $_.Properties[$ProcessIdStop].value -eq $networkStartEvent.Properties[$ProcessIdNew].Value -and $_.properties[$ProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1)
-        }
-        else
-        {
-            Write-Warning "Unable to find network providers start event"
+            $networkStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$ProcessIdStart].value -eq $Logon.WinlogonPID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1 )
+            if( $networkStartEvent )
+            {
+                $Script:Output += Get-PhaseEventFromCache -PhaseName 'Network Providers' `
+                    -startEvent $networkStartEvent `
+                    -endEvent ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.TimeCreated -ge $networkStartEvent.TimeCreated -and $_.Properties[$ProcessIdStop].value -eq $networkStartEvent.Properties[$ProcessIdNew].Value -and $_.properties[$ProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1)
+            }
+            else
+            {
+                [string]$warning = "Unable to find network providers start event"
+                if( $auditingWarning )
+                {
+                    $warning += "`n$auditingWarning"
+                    $auditingWarning = $null ## stop multiple occurrences
+                }
+                Write-Warning $warning
+            }
         }
 
-        if (Get-WinEvent -ListProvider 'Citrix Profile management' -ErrorAction SilentlyContinue) {
+        if ( $global:citrixUPMParams[ 'Path' ] -or ( Get-WinEvent -ListProvider 'Citrix Profile management' -ErrorAction SilentlyContinue)) {
             ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
 
-            [void]$PowerShell.AddScript({
-                Param( $logon , $username )
-                Get-PhaseEvent -PhaseName 'Citrix Profile Mgmt' -StartProvider 'Citrix Profile management' `
-                    -EndProvider 'Microsoft-Windows-User Profiles Service' -StartXPath (
-                    New-XPath -EventId 10 -From (Get-Date -Date $Logon.LogonTime) `
-                    -EventData $UserName) -EndXPath (
-                    New-XPath -EventId 1 -From (Get-Date -Date $Logon.LogonTime) `
-                    -SecurityData @{
-                        UserID=$Logon.UserSID
-                }) })
+            [scriptblock]$citrixScriptBlock = $null
+            if( $global:citrixUPMParams[ 'Path' ] )
+            {
+                $citrixScriptBlock =
+                {
+                    Param( $logon , $username , $CitrixUPMEventFile , $UserProfileEventFile )
+                    Get-PhaseEvent -PhaseName 'Citrix Profile Mgmt' -StartProvider 'Citrix Profile management' `
+                        -StartEventFile $CitrixUPMEventFile `
+                        -EndEventFile $UserProfileEventFile `
+                        -EndProvider 'Microsoft-Windows-User Profiles Service' -StartXPath (
+                        New-XPath -EventId 10 -From (Get-Date -Date $Logon.LogonTime) `
+                         -EventData $UserName) -EndXPath (
+                        New-XPath -EventId 1 -From (Get-Date -Date $Logon.LogonTime) `
+                         -SecurityData @{
+                             UserID=$Logon.UserSID
+                    })
+                }
+            }
+            else ## online
+            {
+                $citrixScriptBlock =
+                {
+                    Param( $logon , $username )
+                    Get-PhaseEvent -PhaseName 'Citrix Profile Mgmt' -StartProvider 'Citrix Profile management' `
+                        -EndProvider 'Microsoft-Windows-User Profiles Service' -StartXPath (
+                        New-XPath -EventId 10 -From (Get-Date -Date $Logon.LogonTime) `
+                            -EventData $UserName) -EndXPath (
+                        New-XPath -EventId 1 -From (Get-Date -Date $Logon.LogonTime) `
+                         -SecurityData @{
+                             UserID=$Logon.UserSID
+                    })
+                }
+            }
+            [void]$PowerShell.AddScript( $citrixScriptBlock )
             [void]$PowerShell.AddParameters( $Parameters )
             [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
         }
 
         ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
 
-        [void]$PowerShell.AddScript({
-            Param( $logon )
-            Get-PhaseEvent -PhaseName 'User Profile' `
-                -eventLog 'Microsoft-Windows-User Profile Service/Operational' `
-                -StartProvider 'Microsoft-Windows-User Profiles Service' `
-                -EndProvider 'Microsoft-Windows-User Profiles Service' `
-                -StartXPath (New-XPath -EventId 1 -From (Get-Date -Date $Logon.LogonTime) `
-                -SecurityData @{UserID=$Logon.UserSID}) `
-                -EndXPath (New-XPath -EventId 2 -From (Get-Date -Date $Logon.LogonTime) `
-                -SecurityData @{
-                    UserID=$Logon.UserSID
-                }) })
-        
+        [scriptblock]$scriptBlock = $null
+        if( $global:userProfileParams[ 'Path' ] )
+        {
+            $scriptBlock = `
+            {
+                Param( $logon , $UserProfileEventFile )
+                Get-PhaseEvent -PhaseName 'User Profile' `
+                    -StartEventFile $UserProfileEventFile `
+                    -EndEventFile $UserProfileEventFile `
+                    -eventLog 'Microsoft-Windows-User Profile Service/Operational' `
+                    -StartProvider 'Microsoft-Windows-User Profiles Service' `
+                    -EndProvider 'Microsoft-Windows-User Profiles Service' `
+                    -StartXPath (New-XPath -EventId 1 -From (Get-Date -Date $Logon.LogonTime) `
+                    -SecurityData @{UserID=$Logon.UserSID}) `
+                    -EndXPath (New-XPath -EventId 2 -From (Get-Date -Date $Logon.LogonTime) `
+                    -SecurityData @{
+                        UserID=$Logon.UserSID
+                    })
+            }
+        }
+        else ## online
+        {
+            $scriptBlock = `
+            {
+                Param( $logon )
+                Get-PhaseEvent -PhaseName 'User Profile' `
+                    -eventLog 'Microsoft-Windows-User Profile Service/Operational' `
+                    -StartProvider 'Microsoft-Windows-User Profiles Service' `
+                    -EndProvider 'Microsoft-Windows-User Profiles Service' `
+                    -StartXPath (New-XPath -EventId 1 -From (Get-Date -Date $Logon.LogonTime) `
+                    -SecurityData @{UserID=$Logon.UserSID}) `
+                    -EndXPath (New-XPath -EventId 2 -From (Get-Date -Date $Logon.LogonTime) `
+                    -SecurityData @{
+                        UserID=$Logon.UserSID
+                    })
+            }
+        }
+        [void]$PowerShell.AddScript( $scriptBlock )
         [void]$PowerShell.AddParameters( $Parameters )
         [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
         
         ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
 
-        [void]$PowerShell.AddScript({
-            Param( $logon , $Username , $UserDomain )
-            Get-PhaseEvent -PhaseName 'Group Policy' `
-                -eventLog 'Microsoft-Windows-GroupPolicy/Operational' `
-                -StartProvider 'Microsoft-Windows-GroupPolicy' `
-                -EndProvider 'Microsoft-Windows-GroupPolicy' `
-                -StartXPath (
-                New-XPath -EventId 4001 -From (Get-Date -Date $Logon.LogonTime) `
-                -EventData @{
-                    PrincipalSamName="$UserDomain\$UserName"
-                }) -EndXPath (
-                New-XPath -EventId 8001 -From (Get-Date -Date $Logon.LogonTime) `
-                -EventData @{
-                    PrincipalSamName="$UserDomain\$UserName"
-                }) })
-       
+        [scriptblock]$groupPolicyScriptBlock = $null
+        if( $global:groupPolicyParams[ 'Path' ] )
+        {
+            $groupPolicyScriptBlock = {
+                Param( $logon , $Username , $UserDomain , $groupPolicyEventFile )
+                Get-PhaseEvent -PhaseName 'Group Policy' `
+                    -StartEventFile $groupPolicyEventFile `
+                    -EndEventFile $groupPolicyEventFile `
+                    -eventLog 'Microsoft-Windows-GroupPolicy/Operational' `
+                    -StartProvider 'Microsoft-Windows-GroupPolicy' `
+                    -EndProvider 'Microsoft-Windows-GroupPolicy' `
+                    -StartXPath (
+                    New-XPath -EventId 4001 -From (Get-Date -Date $Logon.LogonTime) `
+                    -EventData @{
+                        PrincipalSamName="$UserDomain\$UserName"
+                    }) -EndXPath (
+                    New-XPath -EventId 8001 -From (Get-Date -Date $Logon.LogonTime) `
+                    -EventData @{
+                        PrincipalSamName="$UserDomain\$UserName"
+                    })
+             }
+        }
+        else
+        {
+            $groupPolicyScriptBlock = {
+                Param( $logon , $Username , $UserDomain )
+                Get-PhaseEvent -PhaseName 'Group Policy' `
+                    -eventLog 'Microsoft-Windows-GroupPolicy/Operational' `
+                    -StartProvider 'Microsoft-Windows-GroupPolicy' `
+                    -EndProvider 'Microsoft-Windows-GroupPolicy' `
+                    -StartXPath (
+                    New-XPath -EventId 4001 -From (Get-Date -Date $Logon.LogonTime) `
+                    -EventData @{
+                        PrincipalSamName="$UserDomain\$UserName"
+                    }) -EndXPath (
+                    New-XPath -EventId 8001 -From (Get-Date -Date $Logon.LogonTime) `
+                    -EventData @{
+                        PrincipalSamName="$UserDomain\$UserName"
+                    })
+            }
+        }
+         
+        [void]$PowerShell.AddScript( $groupPolicyScriptBlock )
         [void]$PowerShell.AddParameters( $Parameters )
         [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
         
         ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
 
-        [void]$PowerShell.AddScript({
-            Param( $logon , $UserDomain , $Username , $sharedVars )
-            Get-PhaseEvent -PhaseName 'GP Scripts' -StartProvider 'Microsoft-Windows-GroupPolicy' -SharedVars $sharedVars `
-                -EndProvider 'Microsoft-Windows-GroupPolicy' `
-                -StartXPath (
-                New-XPath -EventId 4018 -From (Get-Date -Date $Logon.LogonTime) `
-                -EventData @{PrincipalSamName="$UserDomain\$UserName";ScriptType=1}) `
-                -EndXPath (
-                New-XPath -EventId 5018 -From (Get-Date -Date $Logon.LogonTime) `
-                -EventData @{
-                    PrincipalSamName="$UserDomain\$UserName"
-                    ScriptType=1
-                }) })        
+        [scriptblock]$gpScriptBlock = $null
+        if( $global:groupPolicyParams[ 'Path' ] )
+        {
+            $gpScriptBlock = 
+            {
+                Param( $logon , $UserDomain , $Username , $sharedVars , $groupPolicyEventFile )
+                Get-PhaseEvent -PhaseName 'GP Scripts' -StartProvider 'Microsoft-Windows-GroupPolicy' -SharedVars $sharedVars `
+                    -StartEventFile $groupPolicyEventFile `
+                    -EndEventFile $groupPolicyEventFile `
+                    -EndProvider 'Microsoft-Windows-GroupPolicy' `
+                    -StartXPath (
+                    New-XPath -EventId 4018 -From (Get-Date -Date $Logon.LogonTime) `
+                    -EventData @{PrincipalSamName="$UserDomain\$UserName";ScriptType=1}) `
+                    -EndXPath (
+                    New-XPath -EventId 5018 -From (Get-Date -Date $Logon.LogonTime) `
+                    -EventData @{
+                        PrincipalSamName="$UserDomain\$UserName"
+                        ScriptType=1
+                    })
+             }
+        }
+        else
+        {
+            $gpScriptBlock = 
+            {
+                Param( $logon , $UserDomain , $Username , $sharedVars )
+                Get-PhaseEvent -PhaseName 'GP Scripts' -StartProvider 'Microsoft-Windows-GroupPolicy' -SharedVars $sharedVars `
+                    -EndProvider 'Microsoft-Windows-GroupPolicy' `
+                    -StartXPath (
+                    New-XPath -EventId 4018 -From (Get-Date -Date $Logon.LogonTime) `
+                    -EventData @{PrincipalSamName="$UserDomain\$UserName";ScriptType=1}) `
+                    -EndXPath (
+                    New-XPath -EventId 5018 -From (Get-Date -Date $Logon.LogonTime) `
+                    -EventData @{
+                        PrincipalSamName="$UserDomain\$UserName"
+                        ScriptType=1
+                    })
+             }
+        }
+        [void]$PowerShell.AddScript( $gpScriptBlock )    
         [void]$PowerShell.AddParameters( $Parameters )
         [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
         
         ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
 
-        $userinitStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$ProcessIdStart].value -eq $Logon.WinlogonPID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\userinit.exe' } | Select -Last 1 ) 
+        $userinitStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$TargetLogonId].value -eq $Logon.LogonId `
+            -and $_.Properties[$TargetUserName ].value -eq $Username -and $_.Properties[$TargetDomainName ].value -eq $UserDomain -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\userinit.exe' } | Select -Last 1 ) 
         if( $userinitStartEvent )
         {
             $Script:Output += Get-PhaseEventFromCache -PhaseName 'Pre-Shell (Userinit)' `
@@ -1207,14 +1543,20 @@ function Get-LogonDurationAnalysis {
         }
         else
         {
-            Write-Warning "Unable to find Pre-Shell (Userinit) start event"
+            [string]$info = "Unable to find Pre-Shell (Userinit) start event"
+            if( $auditingWarning )
+            {
+                $info += "`n$auditingWarning"
+                $auditingWarning = $null ## stop multiple occurrences
+            }
+            Write-Warning $info
         }
 
         ## See if user has a login script in AD and if so look for start and end in process start/stop events
         $ADuser = ([ADSI]"WinNT://$UserDomain/$Username,user")
         if( $ADUser -and $ADuser.LoginScript )
         {
-            if( $searchCommandLine )
+            if( $searchCommandLine -or $offline )
             {
                 ## could be more than one since usrlogon.cmd may also be launched so need to check we have the right one although not checking down to which server as can't. Don't check for actual process as could be cmd, wscript, etc
                 [string]$escapedLogonScript = [regex]::Escape( ( Join-Path -Path '\NETLOGON' -ChildPath ($ADuser.LoginScript.ToString()) ) )
@@ -1235,7 +1577,12 @@ function Get-LogonDurationAnalysis {
             if( ! $logonScriptStartEvent )
             {
                 [string]$warning = "Unable to find user logon script ($($ADUser.LoginScript)) start event"
-                if( $commandLinePolicy.ProcessCreationIncludeCmdLine_Enabled -ne 1 )
+                if( $auditingWarning )
+                {
+                    $warning += "`n$auditingWarning"
+                    $auditingWarning = $null ## stop multiple occurrences
+                }
+                if( $commandLinePolicy -and $commandLinePolicy.ProcessCreationIncludeCmdLine_Enabled -ne 1 )
                 {
                     $warning += ', "Command line process auditing" is not enabled'
                 }
@@ -1250,7 +1597,13 @@ function Get-LogonDurationAnalysis {
                 $Script:Output += Get-PhaseEventFromCache -PhaseName 'Shell' -startEvent $shellStartEvent -CUAddition $CUDesktopLoadTime }
             else
             {
-                Write-Warning "Unable to find Shell start event"
+                [string]$warning = "Unable to find Shell start event"
+                if( $auditingWarning )
+                {
+                    $warning += "`n$auditingWarning"
+                    $auditingWarning = $null ## stop multiple occurrences
+                }
+                Write-Warning $warning
             }
         }
         
@@ -1265,7 +1618,11 @@ function Get-LogonDurationAnalysis {
         if( $userinitStartEvent )
         {
             Write-Debug "Get-PrinterEvents -Start $($userinitStartEvent.TimeCreated) -End $(($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}).EndTime) -ClientName $ClientName"
-            Get-PrinterEvents -Start $userinitStartEvent.TimeCreated -End ($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}).EndTime -ClientName $ClientName
+            $end = ($Script:Output | Where {$_.PhaseName -eq 'Pre-Shell (Userinit)'}) | Select-Object -ExpandProperty EndTime
+            if( $end )
+            {
+                Get-PrinterEvents -Start $userinitStartEvent.TimeCreated -End $end -ClientName $ClientName
+            }
         }
 
         if (($Script:Output).Length -lt 2 ) {
@@ -1491,30 +1848,6 @@ public class RDPInfo
 }
 '@
 
-Add-Type $TSSessions
-
-$sessionInfo = [RDPInfo]::listUsers("localhost")
-$sessionArray = @()
-
-#converts Output from pInvoke to PowerShell Object
-foreach ($line in $sessionInfo) {
-    $sessionInfoObject = New-Object System.Object
-    foreach ($object in ($line -split "\t")) {
-    
-        if ($object -like "*UserName*") { Write-Debug "Username: $object"
-            $sessionInfoObject | Add-Member -type NoteProperty -name UserName -value ($object -split ":")[1] }
-        if ($object -like "*SessionID*") { Write-Debug "SessionID: $object"
-            $sessionInfoObject | Add-Member -type NoteProperty -name SessionID -value ($object -split ":")[1] }
-        if ($object -like "*ClientName*") { Write-Debug "ClientName: $object"
-            $sessionInfoObject | Add-Member -type NoteProperty -name ClientName -value ($object -split ":")[1] }
-        if ($object -like "*SessionName*") { Write-Debug "SessionName: $object"
-            $sessionInfoObject | Add-Member -type NoteProperty -name SessionName -value ($object -split ":")[1] }
-    }
-    $sessionArray += $sessionInfoObject
-    
-}
-#endregion
-
 #here we sort out the parameters.  There is an issue with some parameters not being passed so we need to run some checks and validate them.
 $args_fix = ($args[0] -split '\\')
 $UserName = $args_fix[1]
@@ -1524,17 +1857,45 @@ $XDUsername = $null
 $XDPassword = $null
 
 $foundAllParameters = $false
-foreach ($session in $sessionArray) {
-    try {
-        if ($session.Username -eq $args[0] -and $session.SessionId -eq $args[2] -and $session.ClientName -eq $args[4] -and $session.SessionName -eq $args[3] ) {
-            Write-Verbose "All session parameters found"
-            $SessionName = $args[3]
-            $ClientName = $args[4]
-            $foundAllParameters = $true
+
+if( ! $offline )
+{
+    Add-Type $TSSessions
+
+    $sessionInfo = [RDPInfo]::listUsers("localhost")
+    $sessionArray = @()
+
+    #converts Output from pInvoke to PowerShell Object
+    foreach ($line in $sessionInfo) {
+        $sessionInfoObject = New-Object System.Object
+        foreach ($object in ($line -split "\t")) {
+    
+            if ($object -like "*UserName*") { Write-Debug "Username: $object"
+                $sessionInfoObject | Add-Member -type NoteProperty -name UserName -value ($object -split ":")[1] }
+            if ($object -like "*SessionID*") { Write-Debug "SessionID: $object"
+                $sessionInfoObject | Add-Member -type NoteProperty -name SessionID -value ($object -split ":")[1] }
+            if ($object -like "*ClientName*") { Write-Debug "ClientName: $object"
+                $sessionInfoObject | Add-Member -type NoteProperty -name ClientName -value ($object -split ":")[1] }
+            if ($object -like "*SessionName*") { Write-Debug "SessionName: $object"
+                $sessionInfoObject | Add-Member -type NoteProperty -name SessionName -value ($object -split ":")[1] }
         }
+        $sessionArray += $sessionInfoObject
+    
     }
-    catch {
-        ## not all parameters are required when run manually
+    #endregion
+
+    foreach ($session in $sessionArray) {
+        try {
+            if ($session.Username -eq $args[0] -and $session.SessionId -eq $args[2] -and $session.ClientName -eq $args[4] -and $session.SessionName -eq $args[3] ) {
+                Write-Verbose "All session parameters found"
+                $SessionName = $args[3]
+                $ClientName = $args[4]
+                $foundAllParameters = $true
+            }
+        }
+        catch {
+            ## not all parameters are required when run manually
+        }
     }
 }
 
@@ -1553,6 +1914,167 @@ if (-not($foundAllParameters)) {
     }
 }
 
+Write-Debug "UTC offset is $([System.TimeZone]::CurrentTimeZone.GetUtcOffset(0)|Select-Object -ExpandProperty TotalMinutes) minutes"
+
+## if we have extra parameters then let's go into debug mode - must be used with XenDesktop credentials even if dummy until support for null parameters arrives
+if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
+{
+    [string]$logsFolder = $(if( $args.Count -gt 7 ) { $args[ 7 ] } else { $env:CONTROLUP_SUPPORT } )
+    $DebugPreference = 'Continue'
+
+    if( $logsFolder -match '^Prep:(\d+)$' )
+    {
+        [int]$logSize = $Matches[1]
+        $securityEventLog = Get-WinEvent -ListLog 'Security'
+        [string]$size = $null
+
+        if( $logSize -lt 1 )
+        {
+            Throw "$logSize cannot be less than 1MB"
+        }
+        if( $logSize -lt $suggestedSecurityEventLogSizeMB )
+        {
+            Write-Warning "Log size of $($logSize)MB is less than the recommended $($suggestedSecurityEventLogSizeMB)MB"
+        }
+        elseif( $logSize -lt $securityEventLog.MaximumSizeInBytes / 1MB )
+        {
+            Write-Warning "New Security event log size of $($logSize)MB is less than the current $([int]($securityEventLog.MaximumSizeInBytes / 1MB))MB"
+        }
+        elseif( $logSize -gt $securityEventLog.MaximumSizeInBytes / 1MB )
+        {
+            Write-Debug "Increasing security event log maximum size to $($logSize)MB from $([int]($securityEventLog.MaximumSizeInBytes / 1MB))MB"
+            $size = "/maxsize:$($logSize * 1MB)"
+        }
+        else
+        {
+            Write-Warning "Security event log already has max size of $($logSize)MB so not changing"
+        }
+        
+        if( $securityEventLog.LogMode -ne 'Circular' )
+        {
+            Write-Warning "Security event log was previousy not set to overwrite (was $($securityEventLog.LogMode))"
+        }
+        
+        wevtutil.exe set-log Security /retention:false /autobackup:false $size 
+        
+        $null = New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit" -Name 'ProcessCreationIncludeCmdLine_Enabled' -Value 1 -PropertyType 'Dword' -Force
+        
+        [string[]]$eventLogs = @( 'Microsoft-Windows-PrintService/Operational' , 'Microsoft-Windows-GroupPolicy/Operational' , 'Microsoft-Windows-TaskScheduler/Operational' , 'Microsoft-Windows-User Profile Service/Operational' , 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' )
+        [int]$newEventLogSize = 10MB
+        ForEach( $eventLog in $eventLogs )
+        {
+            $eventLogProperties = Get-WinEvent -ListLog $eventLog
+            if( $eventLogProperties )
+            {
+                $commandLine =  "`"$eventLog`" /retention:false /autobackup:false /enabled:true"
+                if( $eventLogProperties.MaximumSizeInBytes -ge $newEventLogSize )
+                {
+                    Write-Warning "Event log `"$eventLog`" already has max size of $([int]($eventLogProperties.MaximumSizeInBytes / 1MB))MB  so not changing"
+                }
+                else
+                {
+                    $commandLine += " /maxsize:$newEventLogSize"
+                }
+                Start-Process -FilePath "wevtutil.exe" -ArgumentList "set-log $commandLine" -Wait -WindowStyle Hidden
+            }
+        }
+
+        [array]$requiredAuditEvents = @(
+            [pscustomobject]@{ 'Policy' = 'Process Creation'     ; 'CategoryGuid' = '6997984C-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce922b-69ae-11d9-bed3-505054503030' }
+            [pscustomobject]@{ 'Policy' = 'Process Termination'  ; 'CategoryGuid' = '6997984C-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce922c-69ae-11d9-bed3-505054503030' }
+            [pscustomobject]@{ 'Policy' = 'Logon'                ; 'CategoryGuid' = '69979849-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce9215-69ae-11d9-bed3-505054503030' }
+         )
+         <#
+        ForEach( $requiredAuditEvent in $requiredAuditEvents )
+        {
+            if( ! ( Set-SystemPolicy -categoryGuid $requiredAuditEvent.CategoryGuid -subCategoryGuid $requiredAuditEvent.SubCategoryGuid  ) )
+            {
+                Write-Warning "Unable to set $($requiredAuditEvent.Policy)"
+            }
+        }
+        #>
+        ## This will not work in some non-English locales like German
+        
+        auditpol.exe /set /subcategory:"Process Termination" /success:enable > $null
+        auditpol.exe /set /subcategory:"Process Creation" /success:enable > $null
+        auditpol.exe /set /subcategory:"Logon" /success:enable > $null
+        #>
+
+        Exit 0
+    }
+    elseif( $logsFolder[0] -eq '+' )
+    {
+        ## we are dumping the logs
+        $logsFolder = $logsFolder.Substring(1)
+        if( ! ( Test-Path -Path $logsFolder -PathType Container -ErrorAction SilentlyContinue ) )
+        {
+            $dumpDir = New-Item -Path $logsFolder -ItemType Directory -Force -ErrorAction Stop
+        }
+        wevtutil.exe export-log "Application" $(Join-Path -Path $logsFolder -ChildPath 'Application.evtx')
+        wevtutil.exe export-log "Security" $(Join-Path -Path $logsFolder -ChildPath 'Security.evtx')
+        wevtutil.exe export-log "Microsoft-Windows-GroupPolicy/Operational" $(Join-Path -Path $logsFolder -ChildPath 'Group Policy.evtx')
+        wevtutil.exe export-log "Microsoft-Windows-PrintService/Operational" $(Join-Path -Path $logsFolder -ChildPath 'Print Service.evtx')
+        wevtutil.exe export-log "Microsoft-Windows-TaskScheduler/Operational" $(Join-Path -Path $logsFolder -ChildPath 'Task Scheduler.evtx')
+        wevtutil.exe export-log "Microsoft-Windows-User Profile Service/Operational" $(Join-Path -Path $logsFolder -ChildPath 'User Profile Service.evtx')
+        wevtutil.exe export-log "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational" $(Join-Path -Path $logsFolder -ChildPath 'Terminal Services LSM.evtx')
+        Write-Debug "Required event logs dumped to `"$logsFolder`". Please zip and email to support@controlup.com"
+    }
+    elseif( Test-Path -Path $logsFolder -PathType Container -ErrorAction SilentlyContinue )
+    {
+        $offline = $true
+
+        ## look for event log files so we can use instead of live logs
+        Get-ChildItem -Path $logsFolder -Filter '*.evtx' -ErrorAction SilentlyContinue | ForEach-Object `
+        {
+            $file = $_
+            switch -Regex( $file.BaseName )
+            {
+                'sec'         { $global:securityParams = @{ 'Path' = $file.FullName } ; break }
+                'group|gpo'   { $global:groupPolicyParams = @{ 'Path' = $file.FullName } ; break }
+                'ts|terminal' { $global:terminalServicesParams = @{ 'Path' = $file.FullName } ; break }
+                'prof'        { $global:userProfileParams = @{ 'Path' = $file.FullName  } ; break }
+                'app'         { $global:citrixUPMParams = @{ 'Path' = $file.FullName } ; break }
+                'sched'       { $global:scheduledTasksParams = @{ 'Path' = $file.FullName } ; break }
+                'print'       { $global:printServiceParams = @{ 'Path' = $file.FullName } ; break }
+            }
+        }
+        if( ! $global:securityParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find Security event log file in `"$logsFolder`""
+        }
+        if( ! $global:groupPolicyParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find Group Policy operational event log file in `"$logsFolder`""
+        }
+        if( ! $global:terminalServicesParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find Terminal Services-Local Session Manager operational event log file in `"$logsFolder`""
+        }
+        if( ! $global:userProfileParams['Path' ] )
+        {
+            Write-Warning "Could not find User Profile Service operational event log file in `"$logsFolder`""
+        }
+        if( ! $global:scheduledTasksParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find User Task Scheduler operational event log file in `"$logsFolder`""
+        }
+        if( ! $global:citrixUPMParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find Application event log (for Citrix Profile Management) file in `"$logsFolder`""
+        }
+        if( ! $global:printServiceParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find User Print Service operational event log file in `"$logsFolder`""
+        }
+        Set-Variable -Name CommandLine -Value 8 -Option ReadOnly -ErrorAction SilentlyContinue
+        if( $env:CONTROLUP_OSVERSION )
+        {
+            $global:windowsMajorVersion = $env:CONTROLUP_OSVERSION
+        }
+    }
+    Write-Debug "Running script as Windows version $global:windowsMajorVersion"
+}
+
 if ( $args.Count -ge 7 -and $args[5] -and $args[6]) {
     $XDUsername = $args[5]
     $XDPassword = $args[6]
@@ -1561,6 +2083,16 @@ if ( $args.Count -ge 7 -and $args[5] -and $args[6]) {
 if ($SessionName -eq $null -and $ClientName -eq $null -and $args.count -eq 5) {
     $XDUsername = $args[3]
     $XDPassword = $args[4]
+}
+
+if( ! $ClientName -and $args.Count -ge 5 )
+{
+    $ClientName = $args[4]
+}
+
+if( ! $SessionName -and $args.Count -ge 4 )
+{
+    $SessionName = $args[3]
 }
 
 Write-Debug "Logon Parameters discovered:"
@@ -1582,7 +2114,7 @@ if( $args.Count -ge 2 -and $args[1] )
 }
 
 if ($SessionName -imatch "RDP") {
-        Get-LogonDurationAnalysis @params 
+        Get-LogonDurationAnalysis @params
     }
 else {
     $params.Add( 'HDXSessionId' , $SessionId )
