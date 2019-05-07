@@ -54,7 +54,7 @@
 		Gets analysis of the logon process for the user 'Rick' in the current domain.
 #>
 
-## Last modified 1345 GMT 07/05/19 @guyrleech
+## Last modified 1735 GMT 07/05/19 @guyrleech
 
 ## A mechanism to allow script use offline with saved event logs
 [hashtable]$global:terminalServicesParams = @{ 'ProviderName' = 'Microsoft-Windows-TerminalServices-LocalSessionManager' }
@@ -69,85 +69,185 @@
 [int]$suggestedSecurityEventLogSizeMB = 100
 [int]$outputWidth = 400
 $DebugPreference = 'SilentlyContinue'
-          
+         
+    <#
+    using System;
+    using System.Text;
+    using System.ComponentModel;
+    using System.Runtime.InteropServices;
+    using System.Security;
+    using System.Security.Principal;
+    using LSA_HANDLE = IntPtr;
+    #>
+ 
 $AuditDefinitions = @'
-
-    /// <summary>
     /// The AuditFree function frees the memory allocated by audit functions for the specified buffer.
-    /// </summary>
-    /// <param name="buffer">A pointer to the buffer to free.</param>
-    /// <remarks>https://msdn.microsoft.com/en-us/library/windows/desktop/aa375654(v=vs.85).aspx</remarks>
+    /// https://msdn.microsoft.com/en-us/library/windows/desktop/aa375654(v=vs.85).aspx
     [DllImport("advapi32.dll")]
     public static extern void AuditFree(IntPtr buffer);
 
-
-    /// <summary>
     /// The AuditQuerySystemPolicy function retrieves system audit policy for one or more audit-policy subcategories.
-    /// </summary>
-    /// <param name="pSubCategoryGuids">A pointer to an array of GUID values that specify the subcategories for which to query audit policy. </param>
-    /// <param name="PolicyCount">The number of elements in each of the pSubCategoryGuids and ppAuditPolicy arrays.</param>
-    /// <param name="ppAuditPolicy">A pointer to a single buffer that contains both an array of pointers to AUDIT_POLICY_INFORMATION structures and the structures themselves. </param>
-    /// <returns>https://msdn.microsoft.com/en-us/library/windows/desktop/aa375702(v=vs.85).aspx</returns>
+    /// https://msdn.microsoft.com/en-us/library/windows/desktop/aa375702(v=vs.85).aspx
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool AuditQuerySystemPolicy(Guid pSubCategoryGuids, uint PolicyCount, out IntPtr ppAuditPolicy);
         
-
-    /// <summary>
     /// The AuditQuerySystemPolicy function retrieves system audit policy for one or more audit-policy subcategories.
-    /// </summary>
-    /// <param name="pSubCategoryGuids">A pointer to an array of GUID values that specify the subcategories for which to query audit policy. </param>
-    /// <param name="PolicyCount">The number of elements in each of the pSubCategoryGuids and ppAuditPolicy arrays.</param>
-    /// <param name="ppAuditPolicy">A pointer to a single buffer that contains both an array of pointers to AUDIT_POLICY_INFORMATION structures and the structures themselves. </param>
-    /// <returns>https://msdn.microsoft.com/en-us/library/windows/desktop/aa375702(v=vs.85).aspx</returns>
+    /// https://msdn.microsoft.com/en-us/library/windows/desktop/aa375702(v=vs.85).aspx</returns>
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool AuditSetSystemPolicy( IntPtr ppAuditPolicy , uint PolicyCount);
 
-    /// <summary>
     /// The AUDIT_POLICY_INFORMATION structure specifies a security event type and when to audit that type.
-    /// </summary>
-    /// <remarks>https://msdn.microsoft.com/en-us/library/windows/desktop/aa965467(v=vs.85).aspx</remarks>
+    /// https://msdn.microsoft.com/en-us/library/windows/desktop/aa965467(v=vs.85).aspx
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct AUDIT_POLICY_INFORMATION
     {
-
-        /// <summary>
         /// A GUID structure that specifies an audit subcategory.
-        /// </summary>
         public Guid AuditSubCategoryGuid;
-
-        /// <summary>
         /// A set of bit flags that specify the conditions under which the security event type specified by the AuditSubCategoryGuid and AuditCategoryGuid members are audited.
-        /// </summary>
         public AUDIT_POLICY_INFORMATION_TYPE AuditingInformation;
-
-        /// <summary>
         /// A GUID structure that specifies an audit-policy category.
-        /// </summary>
         public Guid AuditCategoryGuid;
-
     }
 
-    /// <summary>
-    /// Represents the auditing type.
-    /// </summary>
     [Flags]
     public enum AUDIT_POLICY_INFORMATION_TYPE
     {
-
-        /// <summary>
-        /// Do not audit the specified event type.
-        /// </summary>
         None = 0,
-
-        /// <summary>
-        /// Audit successful occurrences of the specified event type.
-        /// </summary>
         Success = 1,
-
-        /// <summary>
-        /// Audit failed attempts to cause the specified event type.
-        /// </summary>
         Failure = 2,
+    }
+
+    // from https://gallery.technet.microsoft.com/scriptcenter/Grant-Revoke-Query-user-26e259b0
+    public enum Rights
+    {
+        SeTrustedCredManAccessPrivilege,             // Access Credential Manager as a trusted caller
+        SeNetworkLogonRight,                         // Access this computer from the network
+        SeTcbPrivilege,                              // Act as part of the operating system
+        SeMachineAccountPrivilege,                   // Add workstations to domain
+        SeIncreaseQuotaPrivilege,                    // Adjust memory quotas for a process
+        SeInteractiveLogonRight,                     // Allow log on locally
+        SeRemoteInteractiveLogonRight,               // Allow log on through Remote Desktop Services
+        SeBackupPrivilege,                           // Back up files and directories
+        SeChangeNotifyPrivilege,                     // Bypass traverse checking
+        SeSystemtimePrivilege,                       // Change the system time
+        SeTimeZonePrivilege,                         // Change the time zone
+        SeCreatePagefilePrivilege,                   // Create a pagefile
+        SeCreateTokenPrivilege,                      // Create a token object
+        SeCreateGlobalPrivilege,                     // Create global objects
+        SeCreatePermanentPrivilege,                  // Create permanent shared objects
+        SeCreateSymbolicLinkPrivilege,               // Create symbolic links
+        SeDebugPrivilege,                            // Debug programs
+        SeDenyNetworkLogonRight,                     // Deny access this computer from the network
+        SeDenyBatchLogonRight,                       // Deny log on as a batch job
+        SeDenyServiceLogonRight,                     // Deny log on as a service
+        SeDenyInteractiveLogonRight,                 // Deny log on locally
+        SeDenyRemoteInteractiveLogonRight,           // Deny log on through Remote Desktop Services
+        SeEnableDelegationPrivilege,                 // Enable computer and user accounts to be trusted for delegation
+        SeRemoteShutdownPrivilege,                   // Force shutdown from a remote system
+        SeAuditPrivilege,                            // Generate security audits
+        SeImpersonatePrivilege,                      // Impersonate a client after authentication
+        SeIncreaseWorkingSetPrivilege,               // Increase a process working set
+        SeIncreaseBasePriorityPrivilege,             // Increase scheduling priority
+        SeLoadDriverPrivilege,                       // Load and unload device drivers
+        SeLockMemoryPrivilege,                       // Lock pages in memory
+        SeBatchLogonRight,                           // Log on as a batch job
+        SeServiceLogonRight,                         // Log on as a service
+        SeSecurityPrivilege,                         // Manage auditing and security log
+        SeRelabelPrivilege,                          // Modify an object label
+        SeSystemEnvironmentPrivilege,                // Modify firmware environment values
+        SeDelegateSessionUserImpersonatePrivilege,   // Obtain an impersonation token for another user in the same session
+        SeManageVolumePrivilege,                     // Perform volume maintenance tasks
+        SeProfileSingleProcessPrivilege,             // Profile single process
+        SeSystemProfilePrivilege,                    // Profile system performance
+        SeUnsolicitedInputPrivilege,                 // "Read unsolicited input from a terminal device"
+        SeUndockPrivilege,                           // Remove computer from docking station
+        SeAssignPrimaryTokenPrivilege,               // Replace a process level token
+        SeRestorePrivilege,                          // Restore files and directories
+        SeShutdownPrivilege,                         // Shut down the system
+        SeSyncAgentPrivilege,                        // Synchronize directory service data
+        SeTakeOwnershipPrivilege                     // Take ownership of files or other objects
+    }
+    public sealed class TokenManipulator
+    {
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        internal struct TokPriv1Luid
+        {
+            public int Count;
+            public long Luid;
+            public int Attr;
+        }
+
+        internal const int SE_PRIVILEGE_DISABLED = 0x00000000;
+        internal const int SE_PRIVILEGE_ENABLED = 0x00000002;
+        internal const int TOKEN_QUERY = 0x00000008;
+        internal const int TOKEN_ADJUST_PRIVILEGES = 0x00000020;
+
+        internal sealed class Win32Token
+        {
+            [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+            internal static extern bool AdjustTokenPrivileges(
+                IntPtr htok,
+                bool disall,
+                ref TokPriv1Luid newst,
+                int len,
+                IntPtr prev,
+                IntPtr relen
+            );
+
+            [DllImport("kernel32.dll", ExactSpelling = true)]
+            internal static extern IntPtr GetCurrentProcess();
+
+            [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+            internal static extern bool OpenProcessToken(
+                IntPtr h,
+                int acc,
+                ref IntPtr phtok
+            );
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            internal static extern bool LookupPrivilegeValue(
+                string host,
+                string name,
+                ref long pluid
+            );
+
+            [DllImport("kernel32.dll", ExactSpelling = true)]
+            internal static extern bool CloseHandle(
+                IntPtr phtok
+            );
+        }
+
+        public static int AddPrivilege(Rights privilege)
+        {
+            bool retVal;
+            TokPriv1Luid tp;
+            IntPtr hproc = Win32Token.GetCurrentProcess();
+            IntPtr htok = IntPtr.Zero;
+            retVal = Win32Token.OpenProcessToken(hproc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ref htok);
+            tp.Count = 1;
+            tp.Luid = 0;
+            tp.Attr = SE_PRIVILEGE_ENABLED;
+            retVal = Win32Token.LookupPrivilegeValue(null, privilege.ToString(), ref tp.Luid);
+            retVal = Win32Token.AdjustTokenPrivileges(htok, false, ref tp, Marshal.SizeOf(tp), IntPtr.Zero, IntPtr.Zero);
+            Win32Token.CloseHandle(htok);
+            return Marshal.GetLastWin32Error();
+        }
+
+        public static int RemovePrivilege(Rights privilege)
+        {
+            bool retVal;
+            TokPriv1Luid tp;
+            IntPtr hproc = Win32Token.GetCurrentProcess();
+            IntPtr htok = IntPtr.Zero;
+            retVal = Win32Token.OpenProcessToken(hproc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ref htok);
+            tp.Count = 1;
+            tp.Luid = 0;
+            tp.Attr = SE_PRIVILEGE_DISABLED;
+            retVal = Win32Token.LookupPrivilegeValue(null, privilege.ToString(), ref tp.Luid);
+            retVal = Win32Token.AdjustTokenPrivileges(htok, false, ref tp, Marshal.SizeOf(tp), IntPtr.Zero, IntPtr.Zero);
+            Win32Token.CloseHandle(htok);
+            return Marshal.GetLastWin32Error();
+        }
     }
 '@
 
@@ -165,21 +265,16 @@ Function Get-SystemPolicy( [Guid]$subCategoryGuid)
 Function Set-SystemPolicy( [Guid]$subCategoryGuid , [Guid]$categoryGuid  )
 {
     [bool]$result = $false
-    if( ! ( ([System.Management.Automation.PSTypeName]'Win32.Advapi32').Type ) )
-    {
-        [void](Add-Type -MemberDefinition $AuditDefinitions -Name 'Advapi32' -Namespace 'Win32' -UsingNamespace System.Text -Debug:$false)
-    }
     $policy = New-Object -TypeName 'Win32.Advapi32+AUDIT_POLICY_INFORMATION'
-    [IntPtr]$buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal( [System.Runtime.InteropServices.Marshal]::SizeOf( [type][Win32.Advapi32+AUDIT_POLICY_INFORMATION] ) )
+    [IntPtr]$buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal( [System.Runtime.InteropServices.Marshal]::SizeOf( [type]$policy.GetType() ) )
     if( $buffer -ne [IntPtr]::Zero )
     {
-        ##[Win32.Advapi32+AUDIT_POLICY_INFORMATION]$policyEntry = [System.Runtime.InteropServices.Marshal]::PtrToStructure( $buffer ,[type]$policy.GetType())
         $policy.AuditSubCategoryGuid = $subCategoryGuid
         $policy.AuditCategoryGuid = $categoryGuid
         $policy.AuditingInformation = [Win32.Advapi32+AUDIT_POLICY_INFORMATION_TYPE]::Success
-        [IntPtr]$ptr = [IntPtr]::Zero
-        $marshalResult = [System.Runtime.InteropServices.Marshal]::StructureToPtr( $policy , $buffer , $false )
-        $result = [Win32.Advapi32]::AuditSetSystemPolicy( $buffer , [uint64]1 );$LastError = [ComponentModel.Win32Exception][Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        [System.Runtime.InteropServices.Marshal]::StructureToPtr( $policy , $buffer , $false )
+        [uint64]$number = 1
+        $result = [Win32.Advapi32]::AuditSetSystemPolicy( $buffer , $number ); $LastError = [ComponentModel.Win32Exception][Runtime.InteropServices.Marshal]::GetLastWin32Error()
         if( ! $result )
         {
             Write-Warning "AuditSetSystemPolicy failed - $LastError"
@@ -1983,8 +2078,16 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
             [pscustomobject]@{ 'Policy' = 'Process Creation'     ; 'CategoryGuid' = '6997984C-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce922b-69ae-11d9-bed3-505054503030' }
             [pscustomobject]@{ 'Policy' = 'Process Termination'  ; 'CategoryGuid' = '6997984C-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce922c-69ae-11d9-bed3-505054503030' }
             [pscustomobject]@{ 'Policy' = 'Logon'                ; 'CategoryGuid' = '69979849-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce9215-69ae-11d9-bed3-505054503030' }
-         )
-         <#
+        )
+        if( ! ( ([System.Management.Automation.PSTypeName]'Win32.Advapi32').Type ) )
+        {
+            [void](Add-Type -MemberDefinition $AuditDefinitions -Name 'Advapi32' -Namespace 'Win32' -UsingNamespace System.Text,System.ComponentModel,System.Security,System.Security.Principal -Debug:$false)
+        }
+        [int]$privReturn = [Win32.Advapi32+TokenManipulator]::AddPrivilege( [Win32.Advapi32+Rights]::SeSecurityPrivilege )
+        if( $privReturn )
+        {
+            Write-Warning "Failed to enable SeSecurityPrivilege"
+        }
         ForEach( $requiredAuditEvent in $requiredAuditEvents )
         {
             if( ! ( Set-SystemPolicy -categoryGuid $requiredAuditEvent.CategoryGuid -subCategoryGuid $requiredAuditEvent.SubCategoryGuid  ) )
@@ -1992,14 +2095,6 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
                 Write-Warning "Unable to set $($requiredAuditEvent.Policy)"
             }
         }
-        #>
-        ## This will not work in some non-English locales like German
-        
-        auditpol.exe /set /subcategory:"Process Termination" /success:enable > $null
-        auditpol.exe /set /subcategory:"Process Creation" /success:enable > $null
-        auditpol.exe /set /subcategory:"Logon" /success:enable > $null
-        #>
-
         Exit 0
     }
     elseif( $logsFolder[0] -eq '+' )
