@@ -1,5 +1,4 @@
 ﻿#Requires -version 3
-#Requires -RunAsAdministrator
 
 <#
  	.SYNOPSIS
@@ -54,7 +53,7 @@
 		Gets analysis of the logon process for the user 'Rick' in the current domain.
 #>
 
-## Last modified 1735 GMT 07/05/19 @guyrleech
+## Last modified 1836 GMT 10/05/19 @guyrleech
 
 ## A mechanism to allow script use offline with saved event logs
 [hashtable]$global:terminalServicesParams = @{ 'ProviderName' = 'Microsoft-Windows-TerminalServices-LocalSessionManager' }
@@ -68,18 +67,76 @@
 [bool]$offline = $false
 [int]$suggestedSecurityEventLogSizeMB = 100
 [int]$outputWidth = 400
-$DebugPreference = 'SilentlyContinue'
-         
-    <#
-    using System;
-    using System.Text;
-    using System.ComponentModel;
-    using System.Runtime.InteropServices;
-    using System.Security;
-    using System.Security.Principal;
-    using LSA_HANDLE = IntPtr;
-    #>
- 
+
+## https://www.codeproject.com/Articles/18179/Using-the-Local-Security-Authority-to-Enumerate-Us
+$LSADefinitions = @'
+    [DllImport("secur32.dll", SetLastError = false)]
+    public static extern uint LsaFreeReturnBuffer(IntPtr buffer);
+
+    [DllImport("Secur32.dll", SetLastError = false)]
+    public static extern uint LsaEnumerateLogonSessions
+            (out UInt64 LogonSessionCount, out IntPtr LogonSessionList);
+
+    [DllImport("Secur32.dll", SetLastError = false)]
+    public static extern uint LsaGetLogonSessionData(IntPtr luid, 
+        out IntPtr ppLogonSessionData);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LSA_UNICODE_STRING
+    {
+        public UInt16 Length;
+        public UInt16 MaximumLength;
+        public IntPtr buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID
+    {
+        public UInt32 LowPart;
+        public UInt32 HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SECURITY_LOGON_SESSION_DATA
+    {
+        public UInt32 Size;
+        public LUID LoginID;
+        public LSA_UNICODE_STRING Username;
+        public LSA_UNICODE_STRING LoginDomain;
+        public LSA_UNICODE_STRING AuthenticationPackage;
+        public UInt32 LogonType;
+        public UInt32 Session;
+        public IntPtr PSiD;
+        public UInt64 LoginTime;
+        public LSA_UNICODE_STRING LogonServer;
+        public LSA_UNICODE_STRING DnsDomainName;
+        public LSA_UNICODE_STRING Upn;
+    }
+
+    public enum SECURITY_LOGON_TYPE : uint
+    {
+        Interactive = 2,        //The security principal is logging on 
+                                //interactively.
+        Network,                //The security principal is logging using a 
+                                //network.
+        Batch,                  //The logon is for a batch process.
+        Service,                //The logon is for a service account.
+        Proxy,                  //Not supported.
+        Unlock,                 //The logon is an attempt to unlock a workstation.
+        NetworkCleartext,       //The logon is a network logon with cleartext 
+                                //credentials.
+        NewCredentials,         //Allows the caller to clone its current token and
+                                //specify new credentials for outbound connections.
+        RemoteInteractive,      //A terminal server session that is both remote 
+                                //and interactive.
+        CachedInteractive,      //Attempt to use the cached credentials without 
+                                //going out across the network.
+        CachedRemoteInteractive,// Same as RemoteInteractive, except used 
+                                // internally for auditing purposes.
+        CachedUnlock            // The logon is an attempt to unlock a workstation.
+    }
+'@
+
 $AuditDefinitions = @'
     /// The AuditFree function frees the memory allocated by audit functions for the specified buffer.
     /// https://msdn.microsoft.com/en-us/library/windows/desktop/aa375654(v=vs.85).aspx
@@ -310,11 +367,11 @@ Function Test-AuditSettings
     [hashtable]$requiredAuditEvents = @{
         'Process Creation'    = '0cce922b-69ae-11d9-bed3-505054503030'
         'Process Termination' = '0cce922c-69ae-11d9-bed3-505054503030'
-        'Logon'               = '0cce9215-69ae-11d9-bed3-505054503030'
+        ##'Logon'               = '0cce9215-69ae-11d9-bed3-505054503030'
     }
 
     [string]$resultString = $null
-            
+
     if( ! ( ([System.Management.Automation.PSTypeName]'Win32.Advapi32').Type ) )
     {
         [void](Add-Type -MemberDefinition $AuditDefinitions -Name 'Advapi32' -Namespace 'Win32' -UsingNamespace System.Text -Debug:$false)
@@ -869,6 +926,9 @@ function Get-LogonDurationAnalysis {
             if (-not(Test-Path HKU:\)) {
                 New-PSDrive -PSProvider Registry -Name HKU -Root HKEY_USERS | out-null
             }
+            
+            $UserPrinterGUIDs = [System.Collections.ArrayList]@()
+            [array]$PrinterClientSidePortGUIDs = @()
 
             if (-not(Test-Path HKU:\$($Logon.UserSID)\Printers\Connections\ -ErrorAction SilentlyContinue)) {
                 Write-Verbose "Unable to find mapped printers in the user session."  #we'll do our best though with what's available
@@ -877,9 +937,9 @@ function Get-LogonDurationAnalysis {
                 $PrintServers = (Get-ChildItem -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider\Servers").PSChildName
                 Write-Verbose "Found the following print servers:"
                 Write-Verbose "$printServers"
-                foreach ($printServer in $printServers) {
-                  $PrinterClientSidePortGUIDs += Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider\Servers\$printServer\Monitors\Client Side Port\*" -Name PrinterPath
-                }
+                $PrinterClientSidePortGUIDs = @( foreach ($printServer in $printServers) {
+                   Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider\Servers\$printServer\Monitors\Client Side Port\*" -Name PrinterPath
+                })
                 if ($DebugPreference -eq "continue") {
                     Write-Debug "Printer GUIDS:"
                     foreach ($ClientSidePortGUID in $PrinterClientSidePortGUIDs) {
@@ -916,8 +976,8 @@ function Get-LogonDurationAnalysis {
                                 if ($SearchCommandLine) {
                                     Write-Verbose "We can search the command line for the print driver install events"
                                     #pull driver installation time -- requires 2012R2+ and command line capture policy enabled.
-                                    $printDriverInstallationStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\drvinst.exe' -and $_.properties[$CommandLine].Value -like "*$printerGUIDValue*" }) 
-                                    $printDriverInstallationEndEvent = ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.TimeCreated -ge $logon.LogonTime -and $_.properties[$ProcessIdStop].Value -eq $printDriverInstallationStartEvent.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -eq 'C:\Windows\System32\drvinst.exe'})
+                                    $printDriverInstallationStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\drvinst.exe' -and $_.properties[$CommandLine].Value -like "*$printerGUIDValue*" }) 
+                                    $printDriverInstallationEndEvent = ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.properties[$ProcessIdStop].Value -eq $printDriverInstallationStartEvent.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -eq 'C:\Windows\System32\drvinst.exe'})
                                     Write-Verbose "New-TimeSpan -Start $($printDriverInstallationStartEvent.TimeCreated) -End $($printDriverInstallationEndEvent.TimeCreated)"
                                     $Duration = New-TimeSpan -Start $($printDriverInstallationStartEvent.TimeCreated) -End $($printDriverInstallationEndEvent.TimeCreated)
                                     $EventInfo = @{}
@@ -960,8 +1020,8 @@ function Get-LogonDurationAnalysis {
                                             if ($SearchCommandLine) {
                                                 Write-Verbose "We can search the command line for the print driver install events"
                                                 #pull driver installation time -- requires 2012R2+ and command line capture policy enabled.
-                                                $printDriverInstallationStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\drvinst.exe' -and $_.properties[$CommandLine].Value -like "*$printerGUIDValue*" }) 
-                                                $printDriverInstallationEndEvent = ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.TimeCreated -ge $logon.LogonTime -and $_.properties[$ProcessIdStop].Value -eq $printDriverInstallationStartEvent.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -eq 'C:\Windows\System32\drvinst.exe'})
+                                                $printDriverInstallationStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\drvinst.exe' -and $_.properties[$CommandLine].Value -like "*$printerGUIDValue*" }) 
+                                                $printDriverInstallationEndEvent = ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.properties[$ProcessIdStop].Value -eq $printDriverInstallationStartEvent.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -eq 'C:\Windows\System32\drvinst.exe'})
                                                 Write-Verbose "New-TimeSpan -Start $($printDriverInstallationStartEvent.TimeCreated) -End $($printDriverInstallationEndEvent.TimeCreated)"
                                                 $Duration = New-TimeSpan -Start $($printDriverInstallationStartEvent.TimeCreated) -End $($printDriverInstallationEndEvent.TimeCreated)
                                                 $EventInfo = @{}
@@ -1084,16 +1144,17 @@ function Get-LogonDurationAnalysis {
         
         if( ! $offline )
         {
-            $OS = Get-WmiObject -Class win32_operatingsystem -ErrorAction SilentlyContinue
-            $CS = Get-WmiObject -Class win32_computersystem -ErrorAction SilentlyContinue
+            $OS = Get-CimInstance -ClassName win32_operatingsystem -ErrorAction SilentlyContinue
+            $CS = Get-CimInstance -ClassName win32_computersystem -ErrorAction SilentlyContinue
             if( $OS )
             {
-                Write-Debug "OS is $($OS.Caption) $($OS.Version)"
+                Write-Debug "OS is $($OS.Caption) $($OS.Version), last booted $(Get-Date $OS.LastBootupTime -Format G), PowerShell $($PSVersionTable.PSVersion.ToString())"
             }
             if( $CS )
             {
                 Write-Debug "Manufacturer $($CS.Manufacturer) model $($CS.Model), name $($CS.Name) domain $($CS.Domain) virtual $($CS.HypervisorPresent)"
             }
+            <#
             ## this gives us logon time from LSA which is definitive
             Get-WmiObject win32_logonsession -Filter "LogonType='10' or LogonType='12' or LogonType='2' or LogonType='11'" | Sort StartTime -Desc | ForEach-Object `
             {
@@ -1117,8 +1178,10 @@ function Get-LogonDurationAnalysis {
                 ## Not fatal as we will fallback to other methods
                 Write-Warning "Could not find win32_logonsession/win32_loggedonuser object for $UserDomain\$Username"
             }
+            #>
         }
 
+        <#
         try {
             ## Security event on its own happens on reconnect too so we use this log to find session so security event will be before this
             $tsevent = Get-WinEvent -MaxEvents 1 @global:terminalServicesParams  -FilterXPath (
@@ -1148,7 +1211,121 @@ function Get-LogonDurationAnalysis {
             }
             Throw $exceptionString
         }
+        #>
 
+        ## we use LSA to get the definitive logon time
+        
+        if( ! ( ([System.Management.Automation.PSTypeName]'Win32.Secure32').Type ) )
+        {
+            Add-Type -MemberDefinition $LSADefinitions -Name 'Secure32' -Namespace 'Win32' -UsingNamespace System.Text -Debug:$false
+        }
+
+        $count = [UInt64]0
+        $luidPtr = [IntPtr]::Zero
+
+        [uint64]$ntStatus = [Win32.Secure32]::LsaEnumerateLogonSessions( [ref]$count , [ref]$luidPtr )
+
+        if( $ntStatus )
+        {
+            Write-Warning "LsaEnumerateLogonSessions failed with error $ntStatus"
+        }
+        elseif( ! $count )
+        {
+            Write-Warning "No sessions returned by LsaEnumerateLogonSessions"
+        }
+        elseif( $luidPtr -eq [IntPtr]::Zero )
+        {
+            Write-Warning "No buffer returned by LsaEnumerateLogonSessions"
+        }
+        else
+        {   
+            Write-Debug "$count sessions retrieved from LSASS"
+            [IntPtr] $iter = $luidPtr
+            $earliestSession = $null
+            [array]$lsaSessions = @( For ([uint64]$i = 0; $i -lt $count; $i++)
+            {
+                $sessionData = [IntPtr]::Zero
+                $ntStatus = [Win32.Secure32]::LsaGetLogonSessionData( $iter , [ref]$sessionData )
+
+                if( ! $ntStatus -and $sessionData -ne [IntPtr]::Zero )
+                {
+                    $data = [System.Runtime.InteropServices.Marshal]::PtrToStructure( $sessionData , [type][Win32.Secure32+SECURITY_LOGON_SESSION_DATA] )
+
+                    if ($data.PSiD -ne [IntPtr]::Zero)
+                    {
+                        $sid = New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $Data.PSiD
+
+                        #extract some useful information from the session data struct
+                        [datetime]$loginTime = [datetime]::FromFileTime( $data.LoginTime )
+                        $thisUser = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($data.Username.buffer) #get the account name
+                        $thisDomain = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($data.LoginDomain.buffer) #get the domain name
+                        try
+                        { 
+                            $secType = [Win32.Secure32+SECURITY_LOGON_TYPE]$data.LogonType
+                        }
+                        catch
+                        {
+                            $secType = 'Unknown'
+                        }
+
+                        if( ! $earliestSession -or $loginTime -lt $earliestSession )
+                        {
+                            $earliestSession = $loginTime
+                        }
+                        if( $thisUser -eq $Username -and $thisDomain -eq $UserDomain -and $secType -match 'Interactive' )
+                        {
+                            $authPackage = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($data.AuthenticationPackage.buffer) #get the authentication package
+                            $session = $data.Session #get the session number
+                            $logonServer = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($data.LogonServer.buffer) #get the logon server
+                            $DnsDomainName = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($data.DnsDomainName.buffer) #get the DNS Domain Name
+                            $upn = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($data.upn.buffer) #get the User Principal Name
+
+                            [pscustomobject]@{
+                                'Sid' = $sid
+                                'Username' = $thisUser
+                                'Domain' = $thisDomain
+                                'Session' = $session
+                                'LoginId' = [uint64]( $loginID = ($data.LoginID.HighPart -shl 32) + $data.LoginID.LowPart )
+                                'LogonServer' = $logonServer
+                                'DnsDomainName' = $DnsDomainName
+                                'UPN' = $upn
+                                'AuthPackage' = $authPackage
+                                'SecurityType' = $secType
+                                'Type' = $data.LogonType
+                                'LoginTime' = $loginTime
+                            }
+                        }
+                    }
+                    [void][Win32.Secure32]::LsaFreeReturnBuffer( $sessionData )
+                    $sessionData = [IntPtr]::Zero
+                }
+                $iter = $iter.ToInt64() + [System.Runtime.InteropServices.Marshal]::SizeOf([type][Win32.Secure32+LUID])  # move to next pointer
+            }) | Sort-Object -Descending -Property 'LoginTime' ##| Select-Object -First 1
+
+            [void]([Win32.Secure32]::LsaFreeReturnBuffer( $luidPtr ))
+            $luidPtr = [IntPtr]::Zero
+
+            Write-Debug "Found $($lsaSessions.Count) LSA sessions for $UserDomain\$Username, earliest session $(if( $earliestSession ) { Get-Date $earliestSession -Format G } else { 'never' })"
+        }
+
+        if( $lsaSessions -and $lsaSessions.Count )
+        {
+            ## get all logon ids for logons that happened at the same time (TODO - do we need a few milliseconds leeway ?)
+            [array]$loginIds = @( $lsaSessions | Where-Object { $_.LoginTime -eq $lsaSessions[0].LoginTime } | Select-Object -ExpandProperty LoginId )
+            $Logon = New-Object -TypeName psobject -Property @{
+                LogonTime = $lsaSessions[0].LoginTime
+                FormatTime = $lsaSessions[0].LoginTime.ToString( 'HH:mm:ss.ff' )
+                ##WinlogonPID = ($LogonEvent.Properties[16]).Value
+                LogonID = $loginIds
+                UserSID = $lsaSessions[0].Sid
+                Type = $lsaSessions[0].Type
+            }
+        }
+        else
+        {
+            Throw "Failed to retrieve logon session for $UserDomain\$Username from LSASS"
+        }
+        <#
         if ($global:windowsMajorVersion -ge 10) {
             [hashtable]$parameters = @{
                 'UserName' = $userName
@@ -1381,7 +1558,8 @@ function Get-LogonDurationAnalysis {
             $Logon.LogonTime = $wmiEvent.LogonTime
             $logon.FormatTime = '{0:HH:mm:ss.f}' -f $Logon.LogonTime ## show tenths of second since durations are displayed that way
         }
-        Write-Debug "Logon data: $Logon"
+        #>
+        Write-Debug "Logon data: $Logon Logon Ids $($logon.LogonID -join ' , ')"
     }
 
     process {          
@@ -1426,11 +1604,43 @@ function Get-LogonDurationAnalysis {
         {
             Write-Warning "Failed to cache any relevant security event logs from $(Get-Date $logon.LogonTime -Format G) for 60 minutes"
         }
+        
+        $userinitStartEvent = $null
+        ## This doesn't work on Win7 & 2008R2/2012R2 as target username and domainname don't exist - event only have first 9 properties
+        if( [Environment]::OSVersion.Version.Major -eq 6 )
+        {
+            ## we will figure out the correct userinit start event by finding the first explorer.exe or icast.exe process start after logon for this user with the same logonid
+            $shellStart = ($securityEvents | Where-Object { $_.Id -eq 4688 -and $_.Properties[$SubjectLogonId].value -in $Logon.LogonId `
+                -and $_.Properties[$SubjectUserName ].value -eq $Username -and $_.Properties[$SubjectDomainName ].value -eq $UserDomain `
+                    -and ( $_.properties[$NewProcessName].Value -eq (Join-Path -Path $env:SystemRoot -ChildPath 'explorer.exe' ) -or $_.properties[$NewProcessName].Value -eq (Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'Citrix\System32\icast.exe')) } | Select -Last 1 )
+            if( $shellStart )
+            {
+                ## shell will have been spawned by userinit.exe whose pid is $ProcessIdStart of $shellStart so now we can find this
+                $userinitStartEvent = ($securityEvents  |Where-Object { $_.Id -eq 4688 -and $_.Properties[$ProcessIdNew].Value -in $shellStart.Properties[$ProcessIdStart].Value `
+                    -and $_.properties[$NewProcessName].Value -eq (Join-Path -Path ([environment]::getfolderpath('System')) -ChildPath 'userinit.exe' ) } | Select -Last 1 )
+            }
+            else
+            {
+                Write-Debug "Couldn't find a shell start for user"
+            }
+        }
+        else ## 2016/Win10 or later
+        {
+            $userinitStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.Properties[$TargetLogonId].value -in $Logon.LogonId `
+                -and $_.Properties[$TargetUserName ].value -eq $Username -and $_.Properties[$TargetDomainName ].value -eq $UserDomain -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\userinit.exe' } | Select -Last 1 )
+        }
+        
+        ## Now that we don't user the security logon event 4624, we need another way to get the Winlogon PID to be able to find the mpnotify event but it's only required for that
+        ## From the userinit start event, we have the pid of winlogon as that is the parent process
 
         ## only seem to get this when RDS role is installed (Multi-user Win10 or Server OS)
         if( ! $offline -and (Test-Path -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server\Compatibility' -ErrorAction SilentlyContinue) )
         {
-            $networkStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$ProcessIdStart].value -eq $Logon.WinlogonPID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1 )
+            $networkStartEvent = $null
+            if( $userinitStartEvent ) ## need userinitstartevent as it contains Winlogon PID which we used to get from logon event
+            {
+                $networkStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.Properties[$ProcessIdStart].value -eq $userinitStartEvent.Properties[$ProcessIdStart].value -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\mpnotify.exe' } | Select -Last 1 )
+            }
             if( $networkStartEvent )
             {
                 $Script:Output += Get-PhaseEventFromCache -PhaseName 'Network Providers' `
@@ -1628,13 +1838,11 @@ function Get-LogonDurationAnalysis {
         
         ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
 
-        $userinitStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$TargetLogonId].value -eq $Logon.LogonId `
-            -and $_.Properties[$TargetUserName ].value -eq $Username -and $_.Properties[$TargetDomainName ].value -eq $UserDomain -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\System32\userinit.exe' } | Select -Last 1 ) 
         if( $userinitStartEvent )
         {
             $Script:Output += Get-PhaseEventFromCache -PhaseName 'Pre-Shell (Userinit)' `
                 -startEvent $userinitStartEvent `
-                -endEvent ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$SubjectLogonId].value -eq $Logon.LogonID -and ( $_.Properties[$NewProcessName].value -eq 'C:\Windows\explorer.exe' -or $_.Properties[$NewProcessName].value -eq 'C:\Program Files (x86)\Citrix\system32\icast.exe' ) } | Select -Last 1)
+                -endEvent ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $userinitStartEvent.LogonTime -and $_.Properties[$SubjectLogonId].value -in $Logon.LogonID -and ( $_.Properties[$NewProcessName].value -eq 'C:\Windows\explorer.exe' -or $_.Properties[$NewProcessName].value -eq 'C:\Program Files (x86)\Citrix\system32\icast.exe' ) } | Select -Last 1)
         }
         else
         {
@@ -1654,14 +1862,15 @@ function Get-LogonDurationAnalysis {
             if( $searchCommandLine -or $offline )
             {
                 ## could be more than one since usrlogon.cmd may also be launched so need to check we have the right one although not checking down to which server as can't. Don't check for actual process as could be cmd, wscript, etc
+                ## can't check for parent of userinit.exe as that doesn't exist on Win7/2008R2 but we could check for its PID as parent if we have $userinitStartEvent
                 [string]$escapedLogonScript = [regex]::Escape( ( Join-Path -Path '\NETLOGON' -ChildPath ($ADuser.LoginScript.ToString()) ) )
-                $logonScriptStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$SubjectUserName].value -eq $userName -and $_.Properties[$SubjectDomainName].value -eq $UserDomain `
-                     -and $_.Properties[$CommandLine].value -match $escapedLogonScript -and $_.Properties[$ParentProcessName].value -eq 'C:\Windows\System32\userinit.exe' } ) | Select -Last 1
+                $logonScriptStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.Properties[$SubjectUserName].value -eq $userName -and $_.Properties[$SubjectDomainName].value -eq $UserDomain `
+                     -and $_.Properties[$SubjectLogonId].value -in $Logon.LogonId -and $_.Properties[$CommandLine].value -match "[^\\\""]$($escapedLogonScript)[^a-z0-9_]" } ) | Select -Last 1
                 if( $logonScriptStartEvent )
                 {
                     $Script:Output += Get-PhaseEventFromCache -PhaseName 'User logon script' `
                         -startEvent $logonScriptStartEvent `
-                        -endEvent ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.TimeCreated -ge $userinitStartEvent.TimeCreated -and $_.Properties[$ProcessIdStop].value -eq $logonScriptStartEvent.Properties[$ProcessIdNew].value -and $_.Properties[$SubjectLogonId].value -eq $logonScriptStartEvent.Properties[$SubjectLogonId].value } | Select -Last 1)
+                        -endEvent ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.TimeCreated -ge $logonScriptStartEvent.TimeCreated -and $_.Properties[$ProcessIdStop].value -eq $logonScriptStartEvent.Properties[$ProcessIdNew].value -and $_.Properties[$SubjectLogonId].value -eq $logonScriptStartEvent.Properties[$SubjectLogonId].value } | Select -Last 1)
                 }
             }
             else
@@ -1686,7 +1895,7 @@ function Get-LogonDurationAnalysis {
         }
 
         if ($CUDesktopLoadTime -gt 0 ) {
-            $shellStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.TimeCreated -ge $logon.LogonTime -and $_.Properties[$SubjectLogonId].value -eq $Logon.LogonID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\explorer.exe' } | Select -Last 1 ) 
+            $shellStartEvent = ($securityEvents|Where-Object { $_.Id -eq 4688 -and $_.Properties[$SubjectLogonId].value -in $Logon.LogonID -and $_.properties[$NewProcessName].Value -eq 'C:\Windows\explorer.exe' } | Select -Last 1 ) 
             if( $shellStartEvent )
             {
                 $Script:Output += Get-PhaseEventFromCache -PhaseName 'Shell' -startEvent $shellStartEvent -CUAddition $CUDesktopLoadTime }
@@ -1741,7 +1950,7 @@ function Get-LogonDurationAnalysis {
             }
             $Deltas = New-TimeSpan -Start $Script:LogonStartDate -End $Script:Output[0].StartTime
             $Script:Output[0] | Add-Member -MemberType NoteProperty -Name TimeDelta -Value $Deltas -Force
-            $LogonTimeReal =  (Get-Date -Date $Script:LogonStartDate -UFormat %r)
+            $LogonTimeReal =  (Get-Date -Date $Script:LogonStartDate).ToString( 'HH:mm:ss.ff' )
         }
         else {
             $TotalDur = 'N/A'
@@ -1798,6 +2007,18 @@ $PSWindow = (Get-Host).UI.RawUI
 $WideDimensions = $PSWindow.BufferSize
 $WideDimensions.Width = $outputWidth
 $PSWindow.BufferSize = $WideDimensions
+
+$windowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())
+
+if( ! ( $windowsPrincipal.IsInRole( [System.Security.Principal.WindowsBuiltInRole]::Administrator )))
+{
+    Throw 'This script must be run with administrative privilege'
+}
+
+if( ! $Args.Count )
+{
+    Throw 'Must be run with at least the domain\username of the user to report on'
+}
 
 #region Get local session information
 $TSSessions = @'
@@ -2064,7 +2285,7 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
                 $commandLine =  "`"$eventLog`" /retention:false /autobackup:false /enabled:true"
                 if( $eventLogProperties.MaximumSizeInBytes -ge $newEventLogSize )
                 {
-                    Write-Warning "Event log `"$eventLog`" already has max size of $([int]($eventLogProperties.MaximumSizeInBytes / 1MB))MB  so not changing"
+                    Write-Warning "Event log `"$eventLog`" already has max size of $([int]($eventLogProperties.MaximumSizeInBytes / 1MB))MB so not changing"
                 }
                 else
                 {
@@ -2077,7 +2298,7 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
         [array]$requiredAuditEvents = @(
             [pscustomobject]@{ 'Policy' = 'Process Creation'     ; 'CategoryGuid' = '6997984C-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce922b-69ae-11d9-bed3-505054503030' }
             [pscustomobject]@{ 'Policy' = 'Process Termination'  ; 'CategoryGuid' = '6997984C-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce922c-69ae-11d9-bed3-505054503030' }
-            [pscustomobject]@{ 'Policy' = 'Logon'                ; 'CategoryGuid' = '69979849-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce9215-69ae-11d9-bed3-505054503030' }
+            ##[pscustomobject]@{ 'Policy' = 'Logon'                ; 'CategoryGuid' = '69979849-797A-11D9-BED3-505054503030' ; 'SubCategoryGuid' = '0cce9215-69ae-11d9-bed3-505054503030' }
         )
         if( ! ( ([System.Management.Automation.PSTypeName]'Win32.Advapi32').Type ) )
         {
@@ -2114,7 +2335,7 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
         wevtutil.exe export-log "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational" $(Join-Path -Path $logsFolder -ChildPath 'Terminal Services LSM.evtx')
         Write-Debug "Required event logs dumped to `"$logsFolder`". Please zip and email to support@controlup.com"
     }
-    elseif( Test-Path -Path $logsFolder -PathType Container -ErrorAction SilentlyContinue )
+    elseif( Test-Path -LiteralPath $logsFolder -PathType Container -ErrorAction SilentlyContinue )
     {
         $offline = $true
 
