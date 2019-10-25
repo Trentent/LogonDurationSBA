@@ -1,4 +1,4 @@
-#Requires -version 3
+﻿#Requires -version 3
 
 <#
  	.SYNOPSIS
@@ -63,6 +63,8 @@
 [hashtable]$global:scheduledTasksParams = @{ 'ProviderName' = 'Microsoft-Windows-TaskScheduler' }
 [hashtable]$global:citrixUPMParams = @{ 'ProviderName' = 'Citrix Profile Management' }
 [hashtable]$global:printServiceParams = @{ 'ProviderName' = 'Microsoft-Windows-PrintService' }
+[hashtable]$global:windowsShellCoreParams = @{ 'ProviderName' = 'Microsoft-Windows-Shell-Core' }
+[hashtable]$global:appReadinessParams = @{ 'ProviderName' = 'Microsoft-Windows-AppReadiness' }
 [int]$global:windowsMajorVersion = [System.Environment]::OSVersion.Version.Major
 [bool]$offline = $false
 [int]$suggestedSecurityEventLogSizeMB = 100
@@ -1327,6 +1329,8 @@ function Get-LogonDurationAnalysis {
                 'UserProfileEventFile' = $global:userProfileParams[ 'Path' ]
                 'GroupPolicyEventFile' = $global:groupPolicyParams[ 'Path' ]
                 'CitrixUPMEventFile'   = $global:citrixUPMParams[ 'Path' ]
+                'WindowsShellCoreFile'   = $global:windowsShellCoreParams[ 'Path' ]
+                'AppReadinessFile'   = $global:windowsShellCoreParams[ 'Path' ]
              }
 
         # If the machine is a Citrix VDA and a Session ID is provided, look for "HDX Connection" Phase
@@ -1355,7 +1359,7 @@ function Get-LogonDurationAnalysis {
         {
             $securityFilter.Add( 'LogName' , 'Security' )
         }
-        [array]$securityEvents = @( Get-WinEvent -FilterHashtable $securityFilter -ErrorAction SilentlyContinue)
+        [array]$securityEvents = @( Get-WinEvent -FilterHashtable $securityFilter  -ErrorAction SilentlyContinue)
         if( ! $securityEvents -or ! $securityEvents.Count )
         {
             Write-Error "Failed to cache any relevant security event logs from $(Get-Date $logon.LogonTime -Format G) for 60 minutes"
@@ -1530,6 +1534,123 @@ function Get-LogonDurationAnalysis {
             [void]$PowerShell.AddParameters( $Parameters )
             [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
         }
+
+
+        ## TTYE NEW CODE FOR AppX file association load time
+
+         if ( $global:windowsShellCoreParams[ 'Path' ] -or ( Get-WinEvent -ListProvider 'Microsoft-Windows-Shell-Core' -ErrorAction SilentlyContinue)) {
+            ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
+
+            [scriptblock]$windowsShellCoreScriptBlock = $null
+            if( $global:windowsShellCoreParams[ 'Path' ] )
+            {
+                $windowsShellCoreScriptBlock =
+                {
+                    Param( $logon , $username , $WindowsShellCoreFile )
+                    Get-PhaseEvent -PhaseName 'AppX File Associations' -StartProvider 'Microsoft-Windows-Shell-Core' `
+                        -StartEventFile $WindowsShellCoreFile `
+                        -EndEventFile $WindowsShellCoreFile `
+                        -EndProvider 'Microsoft-Windows-Shell-Core' -StartXPath (
+                        New-XPath -EventId 62443 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                Info="AppDefaults-Logon-UserProfileCreated"
+                                }) -EndXPath (
+                        New-XPath -EventId 62443 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                Info="AppDefaults-Logon-UserProfileLoaded"
+                                })
+                }
+            }
+            else ## online
+            {
+                $windowsShellCoreScriptBlock =
+                {
+                    Param( $logon )
+                    Get-PhaseEvent -PhaseName 'AppX File Associations' -StartProvider 'Microsoft-Windows-Shell-Core' `
+                        -EndProvider 'Microsoft-Windows-Shell-Core' -StartXPath (
+                        New-XPath -EventId 62443 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                Info="AppDefaults-Logon-UserProfileCreated"
+                                }) -EndXPath (
+                        New-XPath -EventId 62443 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                Info="AppDefaults-Logon-UserProfileLoaded"
+                                })
+                }
+            }
+            [void]$PowerShell.AddScript( $windowsShellCoreScriptBlock )
+            [void]$PowerShell.AddParameters( $Parameters )
+            [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
+        }
+
+
+
+        ##TTYE New code for AppX application load time
+        if ( $global:appReadinessParams[ 'Path' ] -or ( Get-WinEvent -ListProvider 'Microsoft-Windows-AppReadiness' -ErrorAction SilentlyContinue)) {
+            ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
+
+            [scriptblock]$appReadinessCoreScriptBlock = $null
+            if( $global:appReadinessParams[ 'Path' ] )
+            {
+                $appReadinessCoreScriptBlock =
+                {
+                    Param( $logon , $username , $appReadinessFile )
+                    Get-PhaseEvent -PhaseName 'AppX - Load Packages' -StartProvider 'Microsoft-Windows-AppReadiness' `
+                        -StartEventFile $appReadinessFile `
+                        -EndEventFile $appReadinessFile `
+                        -EndProvider 'Microsoft-Windows-AppReadiness' -StartXPath (
+                        New-XPath -EventId 209 -From (Get-Date -Date $Logon.LogonTime) `
+                            -EventData @{
+                                User=$Logon.UserSID
+                                From=2
+                                To=0
+                                }) -EndXPath (
+                        New-XPath -EventId 209 -From (Get-Date -Date $Logon.LogonTime) `
+                            -EventData @{
+                                User=$Logon.UserSID
+                                From=1
+                                To=2
+                                })
+                }
+            }
+            else ## online
+            {
+                $appReadinessCoreScriptBlock =
+                {
+                    Param( $logon )
+                    Get-PhaseEvent -PhaseName 'AppX - Load Packages' -StartProvider 'Microsoft-Windows-AppReadiness' `
+                        -EndProvider 'Microsoft-Windows-AppReadiness' -StartXPath (
+                        New-XPath -EventId 209 -From (Get-Date -Date $Logon.LogonTime) `
+                            -EventData @{
+                                User=$Logon.UserSID
+                                From=2
+                                To=0
+                                }) -EndXPath (
+                        New-XPath -EventId 209 -From (Get-Date -Date $Logon.LogonTime) `
+                            -EventData @{
+                                User=$Logon.UserSID
+                                From=1
+                                To=2
+                                })
+                }
+            }
+            [void]$PowerShell.AddScript( $appReadinessCoreScriptBlock )
+            [void]$PowerShell.AddParameters( $Parameters )
+            [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
+        }
+
+
+
+
+
 
         ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
 
@@ -1923,7 +2044,7 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
         
         $null = New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit" -Name 'ProcessCreationIncludeCmdLine_Enabled' -Value 1 -PropertyType 'Dword' -Force
         
-        [string[]]$eventLogs = @( 'Microsoft-Windows-PrintService/Operational' , 'Microsoft-Windows-GroupPolicy/Operational' , 'Microsoft-Windows-TaskScheduler/Operational' , 'Microsoft-Windows-User Profile Service/Operational' , 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' )
+        [string[]]$eventLogs = @( 'Microsoft-Windows-Shell-Core/AppDefaults','Microsoft-Windows-PrintService/Operational' , 'Microsoft-Windows-GroupPolicy/Operational' , 'Microsoft-Windows-TaskScheduler/Operational' , 'Microsoft-Windows-User Profile Service/Operational' , 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' )
         [int]$newEventLogSize = 10MB
         ForEach( $eventLog in $eventLogs )
         {
@@ -1984,6 +2105,8 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
         wevtutil.exe export-log "Microsoft-Windows-TaskScheduler/Operational" $(Join-Path -Path $global:logsFolder -ChildPath 'Task Scheduler.evtx')
         wevtutil.exe export-log "Microsoft-Windows-User Profile Service/Operational" $(Join-Path -Path $global:logsFolder -ChildPath 'User Profile Service.evtx')
         wevtutil.exe export-log "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational" $(Join-Path -Path $global:logsFolder -ChildPath 'Terminal Services LSM.evtx')
+        wevtutil.exe export-log "Microsoft-Windows-Shell-Core/AppDefaults" $(Join-Path -Path $global:logsFolder -ChildPath 'AppDefaults.evtx')
+        wevtutil.exe export-log "Microsoft-Windows-AppReadiness/Admin" $(Join-Path -Path $global:logsFolder -ChildPath 'AppReadiness.evtx')
         $global:dumpForOffline = $true
     }
     elseif( Test-Path -LiteralPath $global:logsFolder -PathType Container -ErrorAction SilentlyContinue )
@@ -1996,13 +2119,15 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
             $file = $_
             switch -Regex( $file.BaseName )
             {
-                'sec'         { $global:securityParams = @{ 'Path' = $file.FullName } ; break }
-                'group|gpo'   { $global:groupPolicyParams = @{ 'Path' = $file.FullName } ; break }
-                'ts|terminal' { $global:terminalServicesParams = @{ 'Path' = $file.FullName } ; break }
-                'prof'        { $global:userProfileParams = @{ 'Path' = $file.FullName  } ; break }
-                'app'         { $global:citrixUPMParams = @{ 'Path' = $file.FullName } ; break }
-                'sched'       { $global:scheduledTasksParams = @{ 'Path' = $file.FullName } ; break }
-                'print'       { $global:printServiceParams = @{ 'Path' = $file.FullName } ; break }
+                'sec'          { $global:securityParams = @{ 'Path' = $file.FullName } ; break }
+                'group|gpo'    { $global:groupPolicyParams = @{ 'Path' = $file.FullName } ; break }
+                'ts|terminal'  { $global:terminalServicesParams = @{ 'Path' = $file.FullName } ; break }
+                'prof'         { $global:userProfileParams = @{ 'Path' = $file.FullName  } ; break }
+                'app'          { $global:citrixUPMParams = @{ 'Path' = $file.FullName } ; break }
+                'sched'        { $global:scheduledTasksParams = @{ 'Path' = $file.FullName } ; break }
+                'print'        { $global:printServiceParams = @{ 'Path' = $file.FullName } ; break }
+                'appdefaults'  { $global:windowsShellCoreParams = @{ 'Path' = $file.FullName } ; break }
+                'appreadiness' { $global:appReadinessParams = @{ 'Path' = $file.FullName } ; break }
             }
         }
         if( ! $global:securityParams[ 'Path' ] )
@@ -2032,6 +2157,14 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
         if( ! $global:printServiceParams[ 'Path' ] )
         {
             Write-Warning "Could not find User Print Service operational event log file in `"$global:logsFolder`""
+        }
+        if( ! $global:windowsShellCoreParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find Windows-Shell-Core AppDefaults event log file in `"$global:logsFolder`""
+        }
+        if( ! $global:appReadinessParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find App Readiness Admin event log file in `"$global:logsFolder`""
         }
         Set-Variable -Name CommandLine -Value 8 -Option ReadOnly -ErrorAction SilentlyContinue
 
