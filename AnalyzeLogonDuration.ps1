@@ -513,14 +513,14 @@ function Get-LogonDurationAnalysis {
                 $ecounter++
             }
             if ($ToDate) {
-                [void]$sb.Append(") and TimeCreated[@SystemTime$($greaterThan)='$($FromDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))'")
-                [void]$sb.Append(" and @SystemTime$($lessThan)='$($ToDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))']")
+                [void]$sb.Append(") and TimeCreated[@SystemTime$($greaterThan)='$($FromDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))Z'")
+                [void]$sb.Append(" and @SystemTime$($lessThan)='$($ToDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))Z']")
                 if (!$SecurityData) {
                     [void]$sb.Append("]]")
                 }
             }
             elseif ($FromDate) {
-                [void]$sb.Append(") and TimeCreated[@SystemTime$($greaterThan)='$($FromDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))']")
+                [void]$sb.Append(") and TimeCreated[@SystemTime$($greaterThan)='$($FromDate.ToUniversalTime().ToString("s")).$($FromDate.ToUniversalTime().ToString("fff"))Z']")
                 if (!$SecurityData) {
                     [void]$sb.Append("]]")
                 }
@@ -553,6 +553,7 @@ function Get-LogonDurationAnalysis {
             if ($UserData) {
                 [void]$sb.Append(" and *[UserData[EventXML[($($UserData.Keys[0])=`'$($UserData.Values[0])`')]]]")
             }
+            Write-Debug "Generated XPath Query: $($sb.ToString())"
             $sb.ToString()
         }
         
@@ -717,7 +718,7 @@ function Get-LogonDurationAnalysis {
                 {
                     $PSCmdlet.WriteWarning( $eventLogStatus )
                 }
-                if ($PhaseName -ne 'Citrix Profile Mgmt' -and $PhaseName -ne 'GP Scripts') {
+                if ($PhaseName -ne 'Citrix Profile Mgmt' -and $PhaseName -ne 'GP Scripts' -and $PhaseName -ne '  Shell:AppX File Associations') {
                     if ($StartProvider -eq 'Microsoft-Windows-Security-Auditing' -or $EndProvider -eq 'Microsoft-Windows-Security-Auditing' ) {
                         $PSCmdlet.WriteWarning("Could not find $PhaseName events (requires audit process tracking)")
                     }
@@ -1128,6 +1129,84 @@ function Get-LogonDurationAnalysis {
             }
         }
 
+        function Get-FSLogixProfileEvents {
+            [CmdletBinding()]
+            param(
+            [Parameter(Mandatory=$true)]
+            [DateTime]
+            $Start,
+            
+            [Parameter(Mandatory=$true)]
+            [DateTime]
+            $End,
+
+            [Parameter(Mandatory=$true)]
+            [String]
+            $Username
+            )
+
+            Write-Verbose "Entered Get-FSLogixProfileEvents function"
+            #FSLogix Log path is here: C:\ProgramData\FSLogix\Logs\Profile
+            #at the time of this testing version 2.9.7205.27375 of FSLogix provided all the necessary information
+            $GetFSLogixEvents = $false
+
+            
+            try {
+                $FSLogixLogDir = Get-ItemPropertyValue -Path HKLM:\SOFTWARE\FSLogix\Logging -Name Logdir -ErrorAction SilentlyContinue
+            }
+            Catch {
+                #LogDir registry value not found. Set to default:
+                Write-Verbose "LogDir value not set. Setting LogDir to default path"
+                $FSLogixLogDir = "C:\ProgramData\FSLogix\Logs"
+            }
+
+            if ($FSLogixLogDir -eq $null) {
+                $FSLogixLogDir = "C:\ProgramData\FSLogix\Logs"
+            }
+
+            if (Test-Path "$FSLogixLogDir\Profile") {
+                Write-Verbose "Found FSLogix Profile Log directory."
+                $profileLog = ls "$FSLogixLogDir\Profile" | Where {$_.Name -like "*$($($start).ToString("yyyyMMdd"))*"}
+                if ( Test-Path $profileLog.FullName -ErrorAction SilentlyContinue ) {
+                    $GetFSLogixEvents = $true
+                } else {
+                    Write-Verbose "Unable to determine or find FSLogix profile log file."
+                }
+            }
+
+            
+
+            if ($GetFSLogixEvents) {
+                Write-Verbose "Found Profile Log file: $($profileLog.FullName)"
+
+                $FSLogixLog = Get-Content "$($profileLog.fullname)"
+                $FSLogixLogObject = New-Object System.Collections.ArrayList
+
+                #Create powershell object out of the FSLogix Log.
+                Foreach ($line in $FSLogixLog) {
+                    $line | Select-String -Pattern "\[(.*?)\]|.+" -AllMatches | ForEach-Object{                        if ( $_.Matches.count -eq 4) {                            $MMddyyyy = $(($start).ToString("MM/dd/yyyy"))                            $time = $($_.Matches[0].Value -replace ("\[","") -replace ("\]",""))                            $FSLogixTime = [datetime]"$MMddyyyy $time"                            if (($FSLogixTime -le $end) -and ($FSLogixTime -ge $start)) {                                $obj = [PSCustomObject]@{                                    Time = $FSLogixTime                                    ThreadId = $_.Matches[1].Value -replace ("\[","") -replace ("\]","")                                    LogLevel = $_.Matches[2].Value -replace ("\[","") -replace ("\]","")                                    Message = $_.Matches[3].Value.Trim()                                }                                $FSLogixLogObject.Add($obj)|Out-Null
+                            }
+                        }
+                    }
+                }
+
+                $SessionEvents = $FSLogixLogObject | Where {$_.Message -like "*LoadProfile: $username*"}
+                $FSLogixStartEvent = $SessionEvents[0].time
+                $FSLogixEndEvent = $SessionEvents[1].time
+
+                $Duration = New-TimeSpan -Start $SessionEvents[0].time -End $SessionEvents[1].time
+                $EventInfo = @{}
+                $EventInfo.PhaseName = "FSLogix: LoadProfile"
+                $EventInfo.Duration = $Duration.TotalSeconds
+                $EventInfo.EndTime = $SessionEvents[1].time
+                $EventInfo.StartTime = $SessionEvents[0].time
+                $PSObject = New-Object -TypeName PSObject -Property $EventInfo
+                if ($EventInfo.Duration) {
+                        $Script:Output += $PSObject
+                }
+            }
+        }
+
         ## Set up runspacepool as we will parallelise some operations
         $SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
         
@@ -1139,7 +1218,7 @@ function Get-LogonDurationAnalysis {
             $SessionStateFunction = New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry -ArgumentList $function , $Definition
             $sessionState.Commands.Add($SessionStateFunction)
         }
-
+        
         $RunspacePool = [runspacefactory]::CreateRunspacePool(
             1, ## Min Runspaces
             10 , ## Max parallel runspaces ,
@@ -1547,7 +1626,7 @@ function Get-LogonDurationAnalysis {
                 $windowsShellCoreScriptBlock =
                 {
                     Param( $logon , $username , $WindowsShellCoreFile )
-                    Get-PhaseEvent -PhaseName 'AppX File Associations' -StartProvider 'Microsoft-Windows-Shell-Core' `
+                    Get-PhaseEvent -PhaseName '  Shell:AppX File Associations' -StartProvider 'Microsoft-Windows-Shell-Core' `
                         -StartEventFile $WindowsShellCoreFile `
                         -EndEventFile $WindowsShellCoreFile `
                         -EndProvider 'Microsoft-Windows-Shell-Core' -StartXPath (
@@ -1570,7 +1649,7 @@ function Get-LogonDurationAnalysis {
                 $windowsShellCoreScriptBlock =
                 {
                     Param( $logon )
-                    Get-PhaseEvent -PhaseName 'AppX File Associations' -StartProvider 'Microsoft-Windows-Shell-Core' `
+                    Get-PhaseEvent -PhaseName '  Shell:AppX File Associations' -StartProvider 'Microsoft-Windows-Shell-Core' `
                         -EndProvider 'Microsoft-Windows-Shell-Core' -StartXPath (
                         New-XPath -EventId 62443 -From (Get-Date -Date $Logon.LogonTime) `
                             -SecurityData @{
@@ -1603,7 +1682,7 @@ function Get-LogonDurationAnalysis {
                 $appReadinessCoreScriptBlock =
                 {
                     Param( $logon , $username , $appReadinessFile )
-                    Get-PhaseEvent -PhaseName 'AppX - Load Packages' -StartProvider 'Microsoft-Windows-AppReadiness' `
+                    Get-PhaseEvent -PhaseName '  Shell:AppX - Load Packages' -StartProvider 'Microsoft-Windows-AppReadiness' `
                         -StartEventFile $appReadinessFile `
                         -EndEventFile $appReadinessFile `
                         -EndProvider 'Microsoft-Windows-AppReadiness' -StartXPath (
@@ -1626,7 +1705,7 @@ function Get-LogonDurationAnalysis {
                 $appReadinessCoreScriptBlock =
                 {
                     Param( $logon )
-                    Get-PhaseEvent -PhaseName 'AppX - Load Packages' -StartProvider 'Microsoft-Windows-AppReadiness' `
+                    Get-PhaseEvent -PhaseName '  Shell:AppX - Load Packages' -StartProvider 'Microsoft-Windows-AppReadiness' `
                         -EndProvider 'Microsoft-Windows-AppReadiness' -StartXPath (
                         New-XPath -EventId 209 -From (Get-Date -Date $Logon.LogonTime) `
                             -EventData @{
@@ -1900,6 +1979,8 @@ function Get-LogonDurationAnalysis {
                 Get-PrinterEvents -Start $userinitStartEvent.TimeCreated -End $end -ClientName $ClientName
             }
         }
+
+        Get-FSLogixProfileEvents -Username $Username -Start $Logon.LogonTime -End (($Script:Output | Where {$_.PhaseName -eq "User Profile"}).StartTime)
 
         if (($Script:Output).Length -lt 2 ) {
             $PSCmdlet.WriteWarning("Not enough data for that session, Aborting function...")
