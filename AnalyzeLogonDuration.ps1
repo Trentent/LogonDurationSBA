@@ -1146,31 +1146,41 @@ function Get-LogonDurationAnalysis {
             )
 
             Write-Verbose "Entered Get-FSLogixProfileEvents function"
-            #FSLogix Log path is here: C:\ProgramData\FSLogix\Logs\Profile
+            #Default FSLogix Log path is here: C:\ProgramData\FSLogix\Logs\Profile
             #at the time of this testing version 2.9.7205.27375 of FSLogix provided all the necessary information
             $GetFSLogixEvents = $false
 
-            
-            try {
-                $FSLogixLogDir = Get-ItemPropertyValue -Path HKLM:\SOFTWARE\FSLogix\Logging -Name Logdir -ErrorAction SilentlyContinue
-            }
-            Catch {
-                #LogDir registry value not found. Set to default:
-                Write-Verbose "LogDir value not set. Setting LogDir to default path"
-                $FSLogixLogDir = "C:\ProgramData\FSLogix\Logs"
-            }
-
-            if ($FSLogixLogDir -eq $null) {
-                $FSLogixLogDir = "C:\ProgramData\FSLogix\Logs"
-            }
-
-            if (Test-Path "$FSLogixLogDir\Profile") {
-                Write-Verbose "Found FSLogix Profile Log directory."
-                $profileLog = ls "$FSLogixLogDir\Profile" | Where {$_.Name -like "*$($($start).ToString("yyyyMMdd"))*"}
-                if ( Test-Path $profileLog.FullName -ErrorAction SilentlyContinue ) {
+            if( $offline )
+            {
+                if (Test-Path $(Join-Path -Path $global:logsFolder -ChildPath 'FSLogixProfileLog.txt')) {
+                    Write-Verbose "Offline FSLogix Logfile found."
+                    $profileLog = $(Join-Path -Path $global:logsFolder -ChildPath 'FSLogixProfileLog.txt')
                     $GetFSLogixEvents = $true
                 } else {
-                    Write-Verbose "Unable to determine or find FSLogix profile log file."
+                    Write-Verbose "Unable to determine or find offline FSLogix profile log file."
+                }
+            } else {
+                try {
+                    $FSLogixLogDir = Get-ItemPropertyValue -Path HKLM:\SOFTWARE\FSLogix\Logging -Name Logdir -ErrorAction SilentlyContinue
+                }
+                Catch {
+                    #LogDir registry value not found. Set to default:
+                    Write-Verbose "LogDir value not set. Setting LogDir to default path"
+                    $FSLogixLogDir = "C:\ProgramData\FSLogix\Logs"
+                }
+
+                if ($FSLogixLogDir -eq $null) {
+                    $FSLogixLogDir = "C:\ProgramData\FSLogix\Logs"
+                }
+
+                if (Test-Path "$FSLogixLogDir\Profile") {
+                    Write-Verbose "Found FSLogix Profile Log directory."
+                    $profileLog = ls "$FSLogixLogDir\Profile" | Where {$_.Name -like "*$($($start).ToString("yyyyMMdd"))*"}
+                    if ( Test-Path $profileLog.FullName -ErrorAction SilentlyContinue ) {
+                        $GetFSLogixEvents = $true
+                    } else {
+                        Write-Verbose "Unable to determine or find FSLogix profile log file."
+                    }
                 }
             }
 
@@ -1418,14 +1428,75 @@ function Get-LogonDurationAnalysis {
         {
             Write-Debug "Skipping HDX check as in offline mode"
         }
-        else
+        elseif ((Get-Service -Name BrokerAgent -ErrorAction SilentlyContinue) -and ($HDXSessionId)  ) {
+            if ($XDUsername -and $XDPassword) {
+                $odataPhase = Get-ODataPhase
+            }
+            else {
+                Write-Host "INFO: No credentials entered for the XenDesktop username/password fields"
+            }
+        }
+        elseif (Get-Service -Name WSNM -ErrorAction SilentlyContinue)
         {
-            if ((Get-Service -Name BrokerAgent -ErrorAction SilentlyContinue) -and ($HDXSessionId)  ) {
-                if ($XDUsername -and $XDPassword) {
-                    $odataPhase = Get-ODataPhase
+            ## VMware Horizon View Agent
+            [string]$horizonSessionKey = "HKLM:\SOFTWARE\VMware, Inc.\VMware VDM\SessionData\$SessionId"
+            $horizonInfoValues = Get-ItemProperty -Path $horizonSessionKey -ErrorAction SilentlyContinue
+            if( ! $horizonInfoValues )
+            {
+                Write-Warning "INFO: Unable to locate VMware Horizon View session key `"$horizonSessionKey`""
+            }
+            else
+            {
+                ## See if profilerdata exists yet - it can take up to 10 minues to appear!
+                if( ! $horizonInfoValues.PSObject.Properties[ 'ProfilerData' ] )
+                {
+                    Write-Warning "ProfilerData registry value not yet present in VMware Horizon View session key `"$horizonSessionKey`" - it can take up to 10 minutes to appear"
                 }
-                else {
-                    Write-Host "INFO: No credentials entered for the XenDesktop username/password fields"
+                else
+                {
+                    $profilerData = $horizonInfoValues.ProfilerData | ConvertFrom-Json
+                    if( $profilerData )
+                    {
+                        $versionData = $null
+                        [string]$version = 'Unknown'
+                        if( $profilerData.PSObject.Properties[ 'v2' ] -and $profilerData.v2.PSObject.Properties[ 'broker' ] )
+                        {
+                            $versionData = $profilerData.v2
+                            $version = 'v2'
+                        }
+                        elseif( $profilerData.PSObject.Properties[ 'v1' ] )
+                        {
+                            $versionData = $profilerData.v1
+                            $version = 'v1'
+                        }
+                        if( $versionData )
+                        {
+                            if( $versionData.PSObject.Properties[ 'broker' ] )
+                            {
+                                ## Not strictly OData but hijacking existing variable
+                                $odataPhase = [pscustomobject]@{
+                                    PhaseName = 'View Brokering'
+                                    StartTime = (Get-Date -Date $versionData.broker.s).ToLocalTime()
+                                    EndTime   = (Get-Date -Date $versionData.broker.e).ToLocalTime()
+                                    Duration  = ($versionData.broker.d -as [int]) / 1000 
+                                    Broker    = $horizonInfoValues.ViewClient_Broker_DNS_Name
+                                    'Display Protocol' = $horizonInfoValues.ViewClient_Protocol
+                                    'Client Name' = $horizonInfoValues.ViewClient_Machine_Name }
+                            }
+                            else
+                            {
+                                Write-Warning "No broker data found in $version data in ProfilerData"
+                            }
+                        }
+                        else
+                        {
+                            Write-Warning "No v1 or v2 data found in ProfilerData"
+                        }
+                    }
+                    else
+                    {
+                        Write-Warning "Failed to translate JSON session data information in VMware Horizon View session key `"$horizonSessionKey`""
+                    }
                 }
             }
         }
@@ -1438,7 +1509,7 @@ function Get-LogonDurationAnalysis {
         {
             $securityFilter.Add( 'LogName' , 'Security' )
         }
-        [array]$securityEvents = @( Get-WinEvent -FilterHashtable $securityFilter  -ErrorAction SilentlyContinue)
+        [array]$securityEvents = @( Get-WinEvent -FilterHashtable $securityFilter -ErrorAction SilentlyContinue)
         if( ! $securityEvents -or ! $securityEvents.Count )
         {
             Write-Error "Failed to cache any relevant security event logs from $(Get-Date $logon.LogonTime -Format G) for 60 minutes"
@@ -2042,6 +2113,18 @@ function Get-LogonDurationAnalysis {
         if( $odataPhase ) {
             Add-Member -InputObject $outputObject -MemberType NoteProperty -Name ( '{0} Time' -f $odataPhase.PhaseName ) -Value ( '{0:HH:mm:ss.f}' -f $odataPhase.StartTime )
             Add-Member -InputObject $outputObject -MemberType NoteProperty -Name ( '{0:N1} Duration' -f $odataPhase.PhaseName ) -Value ( '{0} seconds' -f $odataPhase.Duration )
+            if( $odataPhase.PSObject.Properties[ 'Broker' ] )
+            {
+                Add-Member -InputObject $outputObject -MemberType NoteProperty -Name 'Broker' -Value $odataPhase.Broker
+            }
+            if( $odataPhase.PSObject.Properties[ 'Display Protocol' ] )
+            {
+                Add-Member -InputObject $outputObject -MemberType NoteProperty -Name 'Display Protocol' -Value $odataPhase.'Display Protocol'
+            }
+            if( $odataPhase.PSObject.Properties[ 'Client Name' ] )
+            {
+                Add-Member -InputObject $outputObject -MemberType NoteProperty -Name 'Client Name' -Value $odataPhase.'Client Name'
+            }
         }
         Add-Member -InputObject $outputObject -MemberType NoteProperty -Name 'Logon Time' -Value $LogonTimeReal  
         Add-Member -InputObject $outputObject -MemberType NoteProperty -Name 'Logon Duration' -Value ( '{0:N1} seconds' -f $TotalDur )
@@ -2188,6 +2271,36 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
         wevtutil.exe export-log "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational" $(Join-Path -Path $global:logsFolder -ChildPath 'Terminal Services LSM.evtx')
         wevtutil.exe export-log "Microsoft-Windows-Shell-Core/AppDefaults" $(Join-Path -Path $global:logsFolder -ChildPath 'AppDefaults.evtx')
         wevtutil.exe export-log "Microsoft-Windows-AppReadiness/Admin" $(Join-Path -Path $global:logsFolder -ChildPath 'AppReadiness.evtx')
+
+        #region FSLogix Offline Dump
+        ##TTYE - FSLogix Offline Dump
+        try {
+            $FSLogixLogDir = Get-ItemPropertyValue -Path HKLM:\SOFTWARE\FSLogix\Logging -Name Logdir -ErrorAction SilentlyContinue
+        }
+        Catch {
+            #LogDir registry value not found. Set to default:
+            Write-Verbose "LogDir value not set. Setting LogDir to default path"
+            $FSLogixLogDir = "C:\ProgramData\FSLogix\Logs"
+        }
+
+        #sometimes the value exists and is blank. Set to default if it is blank.
+        if ($FSLogixLogDir -eq $null) {
+            $FSLogixLogDir = "C:\ProgramData\FSLogix\Logs"
+        }
+
+        if (Test-Path "$FSLogixLogDir\Profile") {
+            Write-Verbose "Found FSLogix Profile Log directory."
+            $profileLog = ls "$FSLogixLogDir\Profile" | Where {$_.Name -like "*$($($start).ToString("yyyyMMdd"))*"}
+            if ( Test-Path $profileLog.FullName -ErrorAction SilentlyContinue ) {
+                Copy-Item -Path $profileLog.FullName -Destination $(Join-Path -Path $global:logsFolder -ChildPath 'FSLogixProfileLog.txt')
+            } else {
+                Write-Verbose "Unable to determine or find FSLogix profile log file."
+            }
+        }
+         #endregion   
+        
+
+
         $global:dumpForOffline = $true
     }
     elseif( Test-Path -LiteralPath $global:logsFolder -PathType Container -ErrorAction SilentlyContinue )
