@@ -1,4 +1,4 @@
-#Requires -version 3
+﻿#Requires -version 3
 
 <#
  	.SYNOPSIS
@@ -1243,56 +1243,103 @@ function Get-LogonDurationAnalysis {
             $End
             )
 
+            $Script:AppVolumesOutput = @()
+            $end = $end.AddMinutes(2)
+            #region WaitForFirstVolumeOnly
+            <#
+            https://docs.vmware.com/en/VMware-App-Volumes/2.18/com.vmware.appvolumes.admin.doc/GUID-8CB3E73C-2392-40A2-A19A-825D8D487D08.html
+            WaitForFirstVolumeOnly	
+            REG_DWORD	
+            Defined in seconds, only hold logon for the first volume. After the first volume is complete, the remaining are handled in the background, 
+            and the logon process is allowed to proceed. To wait for all volumes to load before releasing the logon process, 
+            set this value to 0. The default is 1.
+
+            From the description this will block the logon process as it will wait for all volumes to attach. We'll track this and change how we measure
+            The AppVolumes - VolumeAttach stage.
+            #>
+            
+            try {
+                $WaitForFirstVolumeOnly = Get-ItemPropertyValue -Path HKLM:\SYSTEM\CurrentControlSet\Services\svservice\Parameters -Name WaitForFirstVolumeOnly
+            } catch {
+                Write-Debug "AppVolumes: WaitForFirstVolumeOnly value not found. Using Default"
+                $WaitForFirstVolumeOnly = $true
+            }
+
+            if ($WaitForFirstVolumeOnly -eq 0) {
+                $WaitForFirstVolumeOnly = $false
+            }
+
+            if ($WaitForFirstVolumeOnly -eq 1) {
+                $WaitForFirstVolumeOnly = $true
+            }
+
+            Write-Debug "AppVolumes: WaitForFirstVolumeOnly set to $WaitForFirstVolumeOnly"
+            #endregion
+
+            #region GetAppVolumesVersion
+            <# AppVolumes changes it's behaviour and sometimes the logs based on version
+            For example, AppVolumes 2.12 had synchronous logon behaviour, AppVolume 2.13 made it optional, 2.14 made it permanent - unable to be removed...?
+            This means we need to change how we show the output of AppVolumes duration. We only want to show AppVolumes that "block" the logon process
+            Any other part that doesn't (eg, user gets to the shell and it's still processing --> then don't add the AppVolumes to the output (adds too much noise)
+            But we can still output how long the packages took at the bottom if someone wants to review.
+            #>
+            [version]$AppVolumeVersion = (Get-Content "${env:ProgramFiles(x86)}\CloudVolumes\Agent\VERSION64.txt").Split("`n")[1]
+
+            if ($AppVolumeVersion -lt [version]"2.12") {
+                Write-Output "Untested AppVolumes version detected: $($AppVolumeVersion)"
+            }
+            Write-Debug "AppVolumes: AppVolumes version detected: $($AppVolumeVersion)"
+            #endregion
+
+            #region GetLogonMode
+            <#
+            Determines if we're logging on ASYNC or synchronously. We'll do that by looking at event 218 and see if the last line in the message is "ASYNC". If
+            it's not then we'll assume we're running synchonsouly.
+            #>
+            
+            $Async = $false
+            $AppVolManagerResponseEvents = Get-WinEvent -FilterHashtable @{ Logname='Application'; ProviderName='svservice'; StartTime=$Start; Id=218 }
+            Foreach ($event in $AppVolManagerResponseEvents) {
+                if (($event.Message -like "*ASYNC*") -or ($event.Properties.value -like "*ASYNC*")) {
+                    $Async=$true
+                }
+            }
+            Write-Debug "AppVolumes: AppVolumes Mount Mode Async? : $Async"
+
+            #endregion
+
+            $FunctionStart = Get-Date
             if (Test-Path "${env:ProgramFiles(x86)}\CloudVolumes\Agent\Logs\svservice.log") {
 
                 ## Step 1, Parse the log file to a sortable, searchable object.
 
-                $FileStream = [System.IO.FileStream]::new("${env:ProgramFiles(x86)}\CloudVolumes\Agent\Logs\svservice.log",[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
-                $StreamReader = [System.IO.StreamReader]::new($FileStream,[System.Text.Encoding]::Default)
-                $DEBUGNumberOfLines = 0
-                $svserviceLogObject = New-Object -TypeName "System.Collections.ArrayList"
+                [int]$DEBUGNumberOfLines = 0
+
                 $StreamStartTime = Get-Date
-                for(;;) {
-                    $line = $StreamReader.ReadLine()
-                    $DEBUGNumberOfLines = $DEBUGNumberOfLines+1
-                    if ($line -eq $null) { #stop when we reach the end
-                        break
-                    }
-                    if ($line -eq "") {  #skip blank lines
-                        continue
-                    }
-                    if ($line.StartsWith("[")) {
-                        $Matches = [regex]::split("$line",'(\[.*?\]) (\[.*?\]) (.+)')
-
-                                                        <# Results should look like this:
-                        $Matches[1]
-                        [2020-02-19 21:43:44.389 UTC]
-
-                        $Matches[2]
-                        [svservice:P1464:T6756]
-
-                        $Matches[3]
-                        OnUnlock called (Session ID 4, Handle 000001FEEDE8D7E0, Params 0000003889BFEAA8, Context 0000000000000000)
-
-                        In total there are 5 matches (including blanks)
-                    #>
-        
-                        if ($Matches.count -eq 5) {
-                            $LineResult = New-Object System.Object
-                            $Time = [datetime]::ParseExact($Matches[1].Replace("[","").Replace("]",""), 'yyyy-MM-dd HH:mm:ss.fff UTC',$null)
-                            $AdjustedForTimeZone = [System.TimeZoneInfo]::ConvertTimeFromUtc($Time, $(Get-TimeZone)) #jeez
-                            $LineResult | Add-Member -type NoteProperty -Name Time -Value $AdjustedForTimeZone
-                            $LineResult | Add-Member -type NoteProperty -Name ProcessInfo -Value ($Matches[2].Replace("[","").Replace("]",""))
-                            $LineResult | Add-Member -type NoteProperty -Name Message -Value ($Matches[3])
-                            $svserviceLogObject.Add($LineResult) | Out-Null
+                $timeZone = Get-TimeZone
+               
+                $svserviceLogObject = @( Get-Content -Path "${env:ProgramFiles(x86)}\CloudVolumes\Agent\Logs\svservice.log" | . { Process `
+                {
+                    ## [2020-01-10 13:43:23.383 UTC] [svservice:P7776:T1108] Service path: C:\Program Files (x86)\CloudVolumes\Agent\svservice.exe
+                    ## Split into 3 - the first two [ ] delimited sections and then the rest
+                    if( $_ -match '^\[([^\]]+)\] \[([^\]]+)\] (.+)$' -and ( $time = [datetime]::ParseExact( $Matches[1] , 'yyyy-MM-dd HH:mm:ss.fff UTC' , $null ) ) `
+                        -and ( $adjustedForTimeZone = [System.TimeZoneInfo]::ConvertTimeFromUtc( $time, $timeZone ) ) `
+                            -and $adjustedForTimeZone -ge $start )
+                    {
+                        $DEBUGNumberOfLines++
+                        [pscustomobject]@{
+                            'Time' = $adjustedForTimeZone
+                            'ProcessInfo' = $Matches[2]
+                            'Message' = $Matches[3]
                         }
                     }
-                }
-                $StreamReader.Close()
-                $StreamEndTime = Get-Date
-                Write-Verbose "AppVolumes log number of lines parsed : $DEBUGNumberOfLines"
-                Write-Verbose "AppVolumes log parsing took : $($(New-TimeSpan -Start $StreamStartTime -End $StreamEndTime).TotalSeconds) seconds"
+                    
+                }})
 
+                $StreamEndTime = Get-Date
+                Write-Debug "AppVolumes: svservice.log: number of lines parsed : $DEBUGNumberOfLines"
+                Write-Debug "AppVolumes: svservice.log parsing took : $($(New-TimeSpan -Start $StreamStartTime -End $StreamEndTime).TotalSeconds) seconds"
+                #endregion
 
                 ## Get Total Phase Events for AppVolumes  --> Commented out for now as AppVolumes includes the entire logon process, even
                 ## parts that it is not blocked on.  I'll setup overall phases to be broken out by Logon and ShellStart
@@ -1318,21 +1365,35 @@ function Get-LogonDurationAnalysis {
                                     #>
                 ## Step 2, Create an object with the following relationship --> AppName, DiskGUID, AppGUID
                 ## Sort log by relevant events
-                $AppVolumesLogonEvents = $svserviceLogObject | Where {($_.Time -ge $Start) -and ($_.Time -le $End)}
-
+                $svserviceLogonEvents = [Collections.Generic.List[Object]]($svserviceLogObject | Where {($_.Time -ge $Start) -and ($_.Time -le $End)})
 
                 ## Get Mapped in AppVolumes from the Event Logs
                 $AppVolumesXPath = New-XPath -EventId 218 -From $Start -ToDate $End
                 $AppVolumeMappedApps = Get-WinEvent -ProviderName 'svservice' -FilterXPath $AppVolumesXPath
                 $AppList = New-Object -TypeName "System.Collections.ArrayList"
-                foreach ($App in ($AppVolumeMappedApps.Message -split "`r`n")) {  #Split at line break
-                    $AppObject = New-Object System.Object
-                    if ($App -like "MOUNTED*") { #Hoping they all start with MOUNTED....
-                        $App = $App -split (";")
-                        $AppObject | Add-Member -Type NoteProperty -Name MountType -Value $App[0]
-                        $AppObject | Add-Member -Type NoteProperty -Name AppPath -Value $App[1]
-                        $AppObject | Add-Member -Type NoteProperty -Name AppGUID -Value $App[2]
-                        $AppList.Add($AppObject) | Out-Null
+                foreach ($App in ($AppVolumeMappedApps)) {  
+                    if ($App.Message -ne $null) { 
+                        $App = $App.Message -split "`r`n"  #Split at line break
+                    } else {
+                        $App = $app.Properties.value -split "`r`n"  #Split at line break
+                    } 
+                    #This changed with AppVolumes Version 4.0. We need to be more precise
+                    foreach ($line in $App) {
+                        if ($line -like "MOUNTED*") { #Hoping they all start with MOUNTED....
+                            $AppDetails = $line -split (";")
+                            $AppObject = New-Object PSCustomObject
+                            Add-Member -InputObject $AppObject -NotePropertyMembers @{
+                                MountType = $AppDetails[0]
+                                AppPath = $AppDetails[1]
+                                AppGUID = $AppDetails[2]
+                                AppId = $null
+                            }
+                            $null = $AppList.Add($AppObject) #use null to suppress count output
+                        }
+                        if ($line -like "ENABLE-APP*") { #Hoping ENABLE-APP is always after MOUNTED-READ
+                            $AppDetails = $line -split (";")
+                            ($AppList | Where-Object {$_.AppGuid -eq $AppDetails[2]}).AppId = $AppDetails[1]
+                        }
                     }
                 }
                 Write-Verbose "AppVolumes List:"
@@ -1341,135 +1402,404 @@ function Get-LogonDurationAnalysis {
                 $AppVolGUIDMappings = New-Object -TypeName "System.Collections.ArrayList"
                 Foreach ($App in $AppList) {
                     Write-Verbose "AppGUID   : $($App.AppGUID)"
-                    $AppVolGUIDEvents = $AppVolumesLogonEvents.Message | Where {$_ -like "*$($App.AppGUID)*"}
-                    Write-Debug "AppVolGUIDEvents : $($AppVolGuidEvents | Out-String)"
+                    $AppVolGUIDEvents = $svserviceLogonEvents.Message | Where {$_ -like "*$($App.AppGUID)*"}
+                    #Write-Debug "AppVolumes: AppVolGUIDEvents : $($AppVolGuidEvents | Out-String)"
                     foreach ($GUIDEvent in $AppVolGUIDEvents) {
                         $Matches = [regex]::Matches("$GUIDEvent","(\\Device.*?) ")
                         if ($Matches -ne $null) {
-                            Write-Verbose "AppDevice : $($Matches.Value)"
-                            $AppVolDeviceEvents = $AppVolumesLogonEvents.Message | Where {$_ -like "*$($Matches.Value)*"}
+                            $Device = $Matches.value
+                            if ($Device -like "*`"*") {
+                                $Device = $Matches.value -replace ("`"","")
+                            }
+                            if ($Device -like "*]*") {
+                                $Device = $Device -replace ("]","")  # AppVolumes Version 4 cleanup
+                            }
+                            if ($Device -like "* *") {
+                                $Device = $Device -replace (" ","")  # AppVolumes Version 4 cleanup
+                            }
+                            #Write-Verbose "AppDevice : $($Device)"
+                            if ($AppVolumeVersion -ge [version]"4.0.0.0") {
+                                $AppVolDeviceEvents = $svserviceLogonEvents.Message | Where {$_ -like "*$($Device)*" -and $_ -like "*OnAddVolume*"}
+                                foreach ($AppVolDeviceEvent in $AppVolDeviceEvents) {
+                                    if ($AppVolGUIDMappings.AppDevice -like $Device) {
+                                    Write-Verbose "Device already exists in AppVolGUIDMappings Object"
+                                    } else {
+                                        Write-Verbose "AppVolumes: AppVolDeviceEvent: $AppVolDeviceEvent"
+                                        Write-Verbose "AppDevice : $($Device)"
+                                        Write-Verbose "Event: $AppVolDeviceEvent"
+                                        $GUIDS = [regex]::Matches($AppVolDeviceEvent,"({[0-9A-Fa-f]{8}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{12}})")
+                                        if ($GUIDS.count -eq 1) {
+                                            $DiskGUID = $GUIDS.Value
+                                        } elseif ($GUIDS.count -eq 2) {
+                                            $DiskGUID = $GUIDS.Value | Where-Object {$_ -ne $($App.AppGUID)}
+                                        } elseif ($GUIDS.count -gt 2) {
+                                            Write-Debug "AppVolumes: ERROR -- Unable to determine DiskGUD"
+                                        }
+                                        Write-Verbose "DiskGUID  : $DiskGUID"
+                                        Write-Verbose "AppId     : $($App.AppID)"
+
+                                        $AppVolMappings = New-Object PSCustomObject
+                                        Add-Member -InputObject $AppVolMappings -NotePropertyMembers @{
+                                            AppGUID = $App.AppGUID
+                                            AppDevice = $Device
+                                            DiskGUID = $DiskGUID
+                                            AppName = (($AppList | Where {$_.AppGUID -eq $App.AppGUID}).AppPath.split("\")[-1].Replace(".vmdk","").Replace("!20!"," ").Replace("!2B!","+"))
+                                            AppId =  $App.AppId #only available with AppVolumes 4+
+                                        }
+                                        $null = $AppVolGUIDMappings.Add($AppVolMappings)  #use null to suppress count output
+                                    }
+                                }
+                            } else {
+                                $AppVolDeviceEvents = $svserviceLogonEvents.Message | Where {$_ -like "*$($Device)*"}
+                            }
+                            
                             ## Do we assume VMWare will always keep the messages to a specific format? Or filter out the AppGUID
                             ## and assume what's left is the device GUID?  I'm leaning towards the latter... Let me know if this fails future Trentent
                             foreach ($AppVolDeviceEvent in $AppVolDeviceEvents) {
-                                if (($AppVolDeviceEvent -like "*$($Matches.Value)*") -and ($AppVolDeviceEvent -notlike "*$($App.AppGUID)*")) {
-                                    Write-Debug "AppVolDeviceEvent: $AppVolDeviceEvent"
-                                    $DiskGUID = [regex]::Match($AppVolDeviceEvent,"({[0-9A-Fa-f]{8}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{12}})")
-                                    Write-Verbose "DiskGUID  : $DiskGUID"
-                                    $AppVolMappings = New-Object System.Object
-                                    $AppVolMappings | Add-Member -Type NoteProperty -Name AppGUID -Value $($App.AppGUID)
-                                    $AppVolMappings | Add-Member -Type NoteProperty -Name AppDevice -Value $($Matches.Value)
-                                    $AppVolMappings | Add-Member -Type NoteProperty -Name DiskGUID -Value $($DiskGUID)
-                                    $AppVolMappings | Add-Member -Type NoteProperty -Name AppName -Value (($AppList | Where {$_.AppGUID -eq $AppVolMappings.AppGUID}).AppPath.split("\")[-1].Replace(".vmdk","").Replace("!20!"," "))
-                                    $AppVolGUIDMappings.Add($AppVolMappings) | Out-Null
+                                if ($AppVolGUIDMappings.AppDevice -like $Device) {
+                                    #Write-Verbose "Device already exists in AppVolGUIDMappings Object"
+                                    } else {
+                                    if (($AppVolDeviceEvent -like "*$($Device)*") -and ($AppVolDeviceEvent -notlike "*$($App.AppGUID)*")) {
+                                        Write-Verbose "AppVolumes: AppVolDeviceEvent: $AppVolDeviceEvent"
+                                        Write-Verbose "AppDevice : $($Device)"
+                                        Write-Verbose "Event: $AppVolDeviceEvent"
+                                        $GUIDS = [regex]::Matches($AppVolDeviceEvent,"({[0-9A-Fa-f]{8}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{4}[-][0-9A-Fa-f]{12}})")
+                                        if ($GUIDS.count -eq 1) {
+                                            $DiskGUID = $GUIDS.Value
+                                        } elseif ($GUIDS.count -eq 2) {
+                                            $DiskGUID = $GUIDS.Value | Where-Object {$_ -ne $($App.AppGUID)}
+                                        } elseif ($GUIDS.count -gt 2) {
+                                            Write-Debug "AppVolumes: ERROR -- Unable to determine DiskGUD"
+                                        }
+                                        Write-Verbose "DiskGUID  : $DiskGUID"
+                                        Write-Verbose "AppId     : $($App.AppID)"
+
+                                        $AppVolMappings = New-Object PSCustomObject
+                                        Add-Member -InputObject $AppVolMappings -NotePropertyMembers @{
+                                            AppGUID = $App.AppGUID
+                                            AppDevice = $Device
+                                            DiskGUID = $DiskGUID
+                                            AppName = (($AppList | Where {$_.AppGUID -eq $App.AppGUID}).AppPath.split("\")[-1].Replace(".vmdk","").Replace("!20!"," ").Replace("!2B!","+"))
+                                            AppId =  $App.AppId #only available with AppVolumes 4+
+                                        }
+                                        $null = $AppVolGUIDMappings.Add($AppVolMappings)  #use null to suppress count output
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                ## Now that we have the full relationships for each App we can trace how long they took for each stage
+                Write-Debug "AppVolumes List:"
+                Write-Debug "$($AppVolGUIDMappings | fl | Out-String)"
+
+                ## Now that we have the full relationships for each App we can get all relevant events
                 $appVolArgs = @{}
                 $appVolArgs.Add("StartTime", $($Start))
                 $appVolArgs.Add("EndTime", $($End))
                 $appVolArgs.Add("ProviderName","svservice")
                 $AppVolWinEvents = Get-WinEvent -FilterHashtable $appVolArgs
 
-                Write-Debug "Number of AppVolume events: $($AppVolWinEvents.count)"
+                Write-Debug "AppVolumes: Number of AppVolume EventLog events: $($AppVolWinEvents.count)"
 
                 #We are going to aggregate all the results. We're going to check for the 3 properties for each AppVolume (DiskGUID, AppGUID, AppDevice)
                 #for each event in the Windows Application Event log, Security Event Log and the svservice.log file. If there is a match we'll add it to a sortable object with those
                 #properties.
-                $perAppTimes = New-Object -TypeName "System.Collections.ArrayList"
-                for ($i=0; $i -lt $AppVolGUIDMappings.Count; $i++) {
+
+                $perAppTimes = New-Object -TypeName "Collections.Generic.List[Object]"
+                for ($i=0; $i -le ($AppVolGUIDMappings.Count-1); $i++) {
                     #get all Windows Application events for that specific AppVol Object
                     foreach ($event in $AppVolWinEvents) {
-                        if (($event.message -like "*$($AppVolGUIDMappings[$i].DiskGUID.Value)*") -or ($event.message -like "*$($AppVolGUIDMappings[$i].AppDevice)*") -or ($event.message -like "*$($AppVolGUIDMappings[$i].AppGUID)*")) {
-                            $perAppTimesObject = @{}
-                            $perAppTimesObject | Add-Member -Type NoteProperty -Name Time -Value $($event.TimeCreated)
-                            $perAppTimesObject | Add-Member -Type NoteProperty -Name Message -Value $($event.Message)
-                            $perAppTimesObject | Add-Member -Type NoteProperty -Name ID -Value $($event.Id)
-                            $perAppTimesObject | Add-Member -Type NoteProperty -Name DiskGUID -Value $($AppVolGUIDMappings[$i].DiskGUID.Value)
-                            $perAppTimesObject | Add-Member -Type NoteProperty -Name AppDevice -Value $($AppVolGUIDMappings[$i].AppDevice)
-                            $perAppTimesObject | Add-Member -Type NoteProperty -Name AppGUID -Value $($AppVolGUIDMappings[$i].AppGUID)
-                            $perAppTimesObject | Add-Member -Type NoteProperty -Name AppName -Value $($AppVolGUIDMappings[$i].AppName)
-                            $perAppTimesObject | Add-Member -Type NoteProperty -Name EventRecord -Value $($event)
-                            $perAppTimes.Add($perAppTimesObject) | Out-Null
-                            #Write-Host "$($event | out-string)"
+                        #sometimes the event provider isn't loaded.  So we need to check if "message" is a valid property and if it's not then call the property value directly.
+                        if ($event.Message -ne $null) { 
+                            $Message = $event.Message #-split "`r`n"  #Split at line break
+                        } else {
+                            $Message = $event.Properties.value #-split "`r`n"  #Split at line break
+                        } 
+                        if ($AppVolumeVersion -ge [version]"4.0.0.0" -and $AppVolumeVersion -lt [version]"9.9.9.9" ) {
+                            if (($Message -like "*$($AppVolGUIDMappings[$i].DiskGUID)*") -or ($Message -like "*$($AppVolGUIDMappings[$i].AppDevice)*") -or ($Message -like "*$($AppVolGUIDMappings[$i].AppGUID)*") -or ($Message -like "*$($AppVolGUIDMappings[$i].AppId)*")) {
+                                $perAppTimesObject = @{}
+                                <#
+                                Write-Verbose "Time          : $($event.TimeCreated)"
+                                Write-Verbose "Message       : $($Message)"
+                                Write-Verbose "ID            : $($event.Id)"
+                                Write-Verbose "DiskGUID      : $($AppVolGUIDMappings[$i].DiskGUID)"
+                                Write-Verbose "AppDevice     : $($AppVolGUIDMappings[$i].AppDevice)"
+                                Write-Verbose "AppGUID       : $($AppVolGUIDMappings[$i].AppGUID)"
+                                Write-Verbose "AppName       : $($AppVolGUIDMappings[$i].AppName)"
+                                #>
+
+                                $perAppTimesObject = New-Object PSCustomObject
+                                Add-Member -InputObject $perAppTimesObject -NotePropertyMembers @{
+                                    Time = $event.TimeCreated
+                                    Message = $Message
+                                    ID = $event.Id
+                                    DiskGUID = $AppVolGUIDMappings[$i].DiskGUID
+                                    AppDevice = $AppVolGUIDMappings[$i].AppDevice
+                                    AppGUID = $AppVolGUIDMappings[$i].AppGUID
+                                    AppName = $AppVolGUIDMappings[$i].AppName
+                                    AppId = $AppVolGUIDMappings[$i].AppId
+                                    EventRecord = $event
+                                }
+                                $null = $perAppTimes.Add($perAppTimesObject)
+                                #Write-Host "$($perAppTimesObject | out-string)"
+                            }
+                        }
+                        if ($AppVolumeVersion -ge [version]"2.12.0.0" -and $AppVolumeVersion -lt [version]"2.19.9.9" ) {
+                            if (($Message -like "*$($AppVolGUIDMappings[$i].DiskGUID)*") -or ($Message -like "*$($AppVolGUIDMappings[$i].AppDevice)*") -or ($Message -like "*$($AppVolGUIDMappings[$i].AppGUID)*")) {
+                                $perAppTimesObject = @{}
+                                <#
+                                Write-Verbose "Time          : $($event.TimeCreated)"
+                                Write-Verbose "Message       : $($Message)"
+                                Write-Verbose "ID            : $($event.Id)"
+                                Write-Verbose "DiskGUID      : $($AppVolGUIDMappings[$i].DiskGUID)"
+                                Write-Verbose "AppDevice     : $($AppVolGUIDMappings[$i].AppDevice)"
+                                Write-Verbose "AppGUID       : $($AppVolGUIDMappings[$i].AppGUID)"
+                                Write-Verbose "AppName       : $($AppVolGUIDMappings[$i].AppName)"
+                                #>
+
+                                $perAppTimesObject = New-Object PSCustomObject
+                                Add-Member -InputObject $perAppTimesObject -NotePropertyMembers @{
+                                    Time = $event.TimeCreated
+                                    Message = $Message
+                                    ID = $event.Id
+                                    DiskGUID = $AppVolGUIDMappings[$i].DiskGUID
+                                    AppDevice = $AppVolGUIDMappings[$i].AppDevice
+                                    AppGUID = $AppVolGUIDMappings[$i].AppGUID
+                                    AppName = $AppVolGUIDMappings[$i].AppName
+                                    AppId = $AppVolGUIDMappings[$i].AppId
+                                    EventRecord = $event
+                                }
+                                $null = $perAppTimes.Add($perAppTimesObject)
+                                #Write-Host "$($perAppTimesObject | out-string)"
+                            }
                         }
                     }
                     #Get svservice.log events
-                    foreach ($event in $svserviceLogObject) {
+                    foreach ($event in $svserviceLogonEvents ) {
                         if ($event.Time -le $End -and $event.Time -ge $Start) {
-                            if (($event.message -like "*$($AppVolGUIDMappings[$i].DiskGUID.Value)*") -or ($event.message -like "*$($AppVolGUIDMappings[$i].AppDevice)*") -or ($event.message -like "*$($AppVolGUIDMappings[$i].AppGUID)*")) {
-                                Write-Debug "Searching for: $($AppVolGUIDMappings[$i].AppDevice)"
-                                $perAppTimesObject = @{}
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name Time -Value $($event.Time)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name ID -Value $($event.ProcessInfo)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name Message -Value $($event.Message)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name DiskGUID -Value $($AppVolGUIDMappings[$i].DiskGUID.Value)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name AppDevice -Value $($AppVolGUIDMappings[$i].AppDevice)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name AppGUID -Value $($AppVolGUIDMappings[$i].AppGUID)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name AppName -Value $($AppVolGUIDMappings[$i].AppName)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name EventRecord -Value $null
-                                $perAppTimes.Add($perAppTimesObject) | Out-Null
+                            if ($AppVolumeVersion -ge [version]"4.0.0.0" -and $AppVolumeVersion -lt [version]"9.9.9.9" ) {
+                                if (($event.Message -like "*$($AppVolGUIDMappings[$i].DiskGUID)*") -or ($event.Message -like "*$($AppVolGUIDMappings[$i].AppDevice)*") -or ($event.Message -like "*$($AppVolGUIDMappings[$i].AppGUID)*") -or  ($event.Message -like "*$($AppVolGUIDMappings[$i].AppId)*")) {
+                                    #Write-Debug "AppVolumes: Searching for: $($AppVolGUIDMappings[$i].AppDevice)"
+                                    $perAppTimesObject = New-Object PSCustomObject
+                                    Add-Member -InputObject $perAppTimesObject -NotePropertyMembers @{
+                                        Time = $event.Time
+                                        Message = $event.Message
+                                        ID = $event.ProcessInfo
+                                        DiskGUID = $AppVolGUIDMappings[$i].DiskGUID
+                                        AppDevice = $AppVolGUIDMappings[$i].AppDevice
+                                        AppGUID = $AppVolGUIDMappings[$i].AppGUID
+                                        AppName = $AppVolGUIDMappings[$i].AppName
+                                        AppId = $AppVolGUIDMappings[$i].AppId
+                                        EventRecord = $null
+                                    }
+                                    $null = $perAppTimes.Add($perAppTimesObject)
+                                }
+                            }
+                            if ($AppVolumeVersion -ge [version]"2.12.0.0" -and $AppVolumeVersion -lt [version]"2.19.9.9" ) {
+                                if (($event.Message -like "*$($AppVolGUIDMappings[$i].DiskGUID)*") -or ($event.Message -like "*$($AppVolGUIDMappings[$i].AppDevice)*") -or ($event.Message -like "*$($AppVolGUIDMappings[$i].AppGUID)*")) {
+                                    #Write-Debug "AppVolumes: Searching for: $($AppVolGUIDMappings[$i].AppDevice)"
+                                    $perAppTimesObject = New-Object PSCustomObject
+                                    Add-Member -InputObject $perAppTimesObject -NotePropertyMembers @{
+                                        Time = $event.Time
+                                        Message = $event.Message
+                                        ID = $event.ProcessInfo
+                                        DiskGUID = $AppVolGUIDMappings[$i].DiskGUID
+                                        AppDevice = $AppVolGUIDMappings[$i].AppDevice
+                                        AppGUID = $AppVolGUIDMappings[$i].AppGUID
+                                        AppName = $AppVolGUIDMappings[$i].AppName
+                                        AppId = $AppVolGUIDMappings[$i].AppId
+                                        EventRecord = $null
+                                    }
+                                    $null = $perAppTimes.Add($perAppTimesObject)
+                                }
                             }
                         }
                     }
                     #Get Process start events
-                    foreach ($event in $securityEvents) {
-                        if ($event.TimeCreated -le $End -and $event.TimeCreated -ge $Start) {
-                            if (($event.message -like "*$($AppVolGUIDMappings[$i].DiskGUID.Value)*") -or ($event.message -like "*$($AppVolGUIDMappings[$i].AppDevice)*") -or ($event.message -like "*$($AppVolGUIDMappings[$i].AppGUID)*")) {
-                                Write-Debug "Searching for: $($AppVolGUIDMappings[$i].AppDevice)"
+                    foreach ($event in ($securityEvents | Where {$_.TimeCreated -le $End -and $_.TimeCreated -ge $Start})) {
+                        if ($AppVolumeVersion -ge [version]"4.0.0.0" -and $AppVolumeVersion -lt [version]"9.9.9.9" ) {
+                            if ($event.Message -like "*.BAT*") {
+                                #Write-Debug "AppVolumes: Searching for SecurityEvents : $($AppVolGUIDMappings[$i].AppDevice)"
                                 #This finds process start events.  Need to find process end events (see further below)
-                                $perAppTimesObject = @{}
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name Time -Value $($event.TimeCreated)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name ID -Value $($event.Id)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name Message -Value $($event.Message)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name DiskGUID -Value $($AppVolGUIDMappings[$i].DiskGUID.Value)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name AppDevice -Value $($AppVolGUIDMappings[$i].AppDevice)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name AppGUID -Value $($AppVolGUIDMappings[$i].AppGUID)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name AppName -Value $($AppVolGUIDMappings[$i].AppName)
-                                $perAppTimesObject | Add-Member -Type NoteProperty -Name EventRecord -Value $($event)
-                                $perAppTimes.Add($perAppTimesObject) | Out-Null
+                                $perAppTimesObject = New-Object PSCustomObject
+                                Add-Member -InputObject $perAppTimesObject -NotePropertyMembers @{
+                                    Time = $event.TimeCreated
+                                    Message = $event.Message
+                                    ID = $event.Id
+                                    DiskGUID = $AppVolGUIDMappings[$i].DiskGUID
+                                    AppDevice = $AppVolGUIDMappings[$i].AppDevice
+                                    AppGUID = $AppVolGUIDMappings[$i].AppGUID
+                                    AppName = $AppVolGUIDMappings[$i].AppName
+                                    AppId = $AppVolGUIDMappings[$i].AppId
+                                    EventRecord = $event
+                                }
+                                $null = $perAppTimes.Add($perAppTimesObject)
+                            }
+                        }
+                        if ($AppVolumeVersion -ge [version]"2.12.0.0" -and $AppVolumeVersion -lt [version]"2.19.9.9" ) {
+                            if (($event.Message -like "*.BAT*") -and ($event.Message -like "*$($AppVolGUIDMappings[$i].DiskGUID)*") -or ($event.Message -like "*$($AppVolGUIDMappings[$i].AppDevice)*") -or ($event.Message -like "*$($AppVolGUIDMappings[$i].AppGUID)*")) {
+                                #Write-Debug "AppVolumes: Searching for SecurityEvents : $($AppVolGUIDMappings[$i].AppDevice)"
+                                <#
+                                Write-Verbose "Time          : $($event.TimeCreated)"
+                                Write-Verbose "Message       : $($event.Message)"
+                                Write-Verbose "ID            : $($event.Id)"
+                                Write-Verbose "DiskGUID      : $($AppVolGUIDMappings[$i].DiskGUID)"
+                                Write-Verbose "AppDevice     : $($AppVolGUIDMappings[$i].AppDevice)"
+                                Write-Verbose "AppGUID       : $($AppVolGUIDMappings[$i].AppGUID)"
+                                Write-Verbose "AppName       : $($AppVolGUIDMappings[$i].AppName)"
+                                #>
+                                #This finds process start events.  Need to find process end events (see further below)
+                                $perAppTimesObject = New-Object PSCustomObject
+                                Add-Member -InputObject $perAppTimesObject -NotePropertyMembers @{
+                                    Time = $event.TimeCreated
+                                    Message = $event.Message
+                                    ID = $event.Id
+                                    DiskGUID = $AppVolGUIDMappings[$i].DiskGUID
+                                    AppDevice = $AppVolGUIDMappings[$i].AppDevice
+                                    AppGUID = $AppVolGUIDMappings[$i].AppGUID
+                                    AppName = $AppVolGUIDMappings[$i].AppName
+                                    AppId = $AppVolGUIDMappings[$i].AppId
+                                    EventRecord = $event
+                                }
+                                $null = $perAppTimes.Add($perAppTimesObject)
+                            }
+                        }
+                    }
+                }
+                #Get Process End Events -- AppVolumes 4.0 uses short names and a generic path to launch scripts now. e.g. "C:\PROGRA~2\CLOUDV~1\Agent\Config\Default\app\ALLVOL~2.BAT"
+                #However, it sometimes still calls scripts or other exe's from the disk paths. These aren't the launch scripts now, but we can check in on them later...
+                #Another problem with AppVolumes 4...  It moved to launching the command scripts from the svservice.exe which is the same for all apps. But the svservice.log
+                #tracks process id events, if we can correlate them...
+                $PerAppProcessStartEvents = $perAppTimes | Where {$_.id -eq 4688}
+                foreach ($event in $PerAppProcessStartEvents) {
+                    $BatchStartEvent = ($securityEvents | Where-Object { ($_.Id -eq 4688) -and ($_.Message -like "$($event.message)") -and ($_.TimeCreated -eq $event.Time) }) 
+                    $BatchEndEvent   = ($securityEvents | Where-Object { $_.Id -eq 4689 -and $_.properties[$ProcessIdStop].Value -eq $BatchStartEvent.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -like '*cmd.exe*'})
+                    if ($BatchEndEvent -ne $null) {
+                        #Write-Debug "AppVolumes: Found process end event: $(($BatchEndEvent).TimeCreated) : $(($BatchEndEvent).Message.Substring(0,20))"
+                        #This finds process start events.  Need to find process end events (see further below)
+                        $perAppTimesObject = New-Object PSCustomObject
+                        Add-Member -InputObject $perAppTimesObject -NotePropertyMembers @{
+                            Time = $BatchEndEvent.TimeCreated
+                            Message = $BatchEndEvent.Message
+                            ID = $BatchEndEvent.Id
+                            DiskGUID = $event.DiskGUID
+                            AppDevice = $event.AppDevice
+                            AppGUID = $event.AppGUID
+                            AppName = $event.AppName
+                            AppId = $PerAppProcessStartEvents.AppId
+                            EventRecord = $event
+                        }
+                        $null = $perAppTimes.Add($perAppTimesObject)
+                    }
+                }
+            
+                #measure appvolumes logon blocking event (Wait for volume(s) to mount) -- start (eventID 210) and end event "227" in - last 227 event if WaitForVolumes is false/first if true
+                $startRecord = $AppVolWinEvents | Where-Object {$_.id -eq "210"}
+                if ($WaitForFirstVolumeOnly) {
+                    $endRecord = ($AppVolWinEvents | Where-Object {$_.id -eq "226"} | Sort-Object -Property TimeCreated)[0]
+                } else {
+                    $endRecord = ($AppVolWinEvents | Where-Object {$_.id -eq "227"} | Sort-Object -Property TimeCreated)[-1]
+                }
+                $Duration = New-TimeSpan -Start $StartRecord.TimeCreated -End $EndRecord.TimeCreated
+                $EventInfo = @{}
+                $EventInfo.PhaseName = "AppVolumes:Wait For Volume Attach"
+                $EventInfo.Duration = $Duration.TotalSeconds
+                $EventInfo.EndTime = $EndRecord.TimeCreated
+                $EventInfo.StartTime = $StartRecord.TimeCreated
+                $PSObject = New-Object -TypeName PSObject -Property $EventInfo
+                if ($EventInfo.Duration) {
+                    $Script:Output += $PSObject
+                }
                 
+
+                #PerApp Phases
+                if ($AppVolumeVersion -ge [version]"4.0.0.0" -and $AppVolumeVersion -lt [version]"9.9.9.9" ) {
+                    foreach ($app in $AppVolGUIDMappings) {
+                        $appEvents = [Collections.Generic.List[Object]]($perAppTimes | Where {$_.AppGuid -eq $app.AppGUID} | Sort-Object -Property Time)
+                        $scriptStartEvents = $appEvents | Where {$_.Message -like "*RunScript_Volume*"} #scripts seem to be the primary driver of delays so we'll attempt to measure them
+                        for ($i=0;$i -lt ($scriptStartEvents.count-1); $i++) {
+                            $index = ($svserviceLogonEvents.FindIndex({$args[0].Message -eq "$($ScriptStartEvents[$i].Message)"}))
+                            #Write-Host "Index: $index"
+                            $stage = $([regex]::Matches($ScriptStartEvents[$i].Message, "(\[.*?\])")[0])
+                            Write-Verbose "AppVolumes: Phase Event: $($app.AppName) - $stage"
+                            #Get launch event that should occur immediately after RunScript_
+                            #Look for event 4688 and 4689 pairs
+                            Write-Verbose "AppVolumes: Message to key in on: `"$($ScriptStartEvents[$i].Message)`""
+                            $StartEvent = $null
+                            $EndEvent = $null
+                            for ($a=$index;$a -lt ($index+8); $a++) {  #script launch events should occur within the next 4 lines (for AppVolumes 4)
+                                if (($($svserviceLogonEvents[$a].Message) -like "*BAT*pid=*") -and ($svserviceLogonEvents[$a].ProcessInfo -like $ScriptStartEvents[$i].Id)){  #sample line: CreateProcessCheckResult: Successfully launched: "C:\PROGRA~2\CLOUDV~1\Agent\Config\Default\app\SHELLS~1.BAT". WaitMilliseconds -1 ms, pid=6244 tid=2780
+                                    $processId = [regex]::Matches(($svserviceLogonEvents[$a].Message),"(pid=(.*?)) ").groups[2].Value
+                                    Write-Verbose "AppVolumes: Found PID : $processId"
+                                    foreach ($eventRecord in ($perAppTimes | Where {$_.Id -eq 4688}).EventRecord) {
+                                        if ($eventRecord.properties[$processIdNew].Value -eq $processId) {
+                                            $startRecord = $eventRecord
+                                            $endRecord = ($securityEvents | Where-Object { $_.Id -eq 4689 -and $_.properties[$ProcessIdStop].Value -eq $startRecord.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -like '*cmd.exe*'})
+                                            $Duration = New-TimeSpan -Start $startRecord.TimeCreated -End $endRecord.TimeCreated
+                                            $EventInfo = @{}
+                                            $EventInfo.PhaseName = "AppVolumes:$($stage):$($App.AppName)"
+                                            $EventInfo.Duration = $Duration.TotalSeconds
+                                            $EventInfo.EndTime = $endRecord.TimeCreated
+                                            $EventInfo.StartTime = $startRecord.TimeCreated
+                                            $PSObject = New-Object -TypeName PSObject -Property $EventInfo
+                                        }
+                                    }
+                                    $Script:AppVolumesOutput  += $PSObject
+                                }
+                            }
+                        }
+                    }
+                }
+            
+
+                if ($AppVolumeVersion -ge [version]"2.13.0.0" -and $AppVolumeVersion -lt [version]"2.19.9.9" ) {
+                #OK, we finally have all of our information we need to measure everything. We will measure each app for each stage. For each stage
+                #we are going to find the process start and end times and use the process end times to determine when the app completed it's work.
+                #this is because the events AppVolumes generates are ambiguous for when a script finishes or when a stage was complete. If we can't find the event
+                #Find first Logon Event
+                $stages = @("prestartup","startup_postsvc","startup","logon","allvolattached","shellstart")
+                foreach ($App in $AppVolGUIDMappings) {
+                    #Write-Host "$($app.AppName)"
+                    foreach ($stage in $stages) {
+                            try {
+                                $Events = ($perAppTimes |Where {($_.Message -like "*\$stage.bat*" -and $_.AppGUID -eq $($App.AppGuid)) }).EventRecord
+                                $StartRecord = $Events | Where {$_.Id -eq 4688 -and $_.Message -like "*\$stage.bat*"}
+                                $EndRecord   = ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.properties[$ProcessIdStop].Value -eq $StartRecord.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -like '*cmd.exe*'})
+                                #Write-Verbose "Stage       = $($stage)"
+                                #Write-Verbose "AppName     = $($App.AppName)"
+                                #Write-Verbose "StartRecord = $($StartRecord.Message.Substring(0,20))"
+                                #Write-Verbose "EndRecord   = $($EndRecord.Message.Substring(0,20))"
+                                #Get-PhaseEvent -PhaseName " AppVolumes:$($stage):$($App.AppName)" -SharedVars $sharedVars -StartEvent $StartRecord -EndEvent $EndRecord
+                                $Duration = New-TimeSpan -Start $StartRecord.TimeCreated -End $EndRecord.TimeCreated
+                                $EventInfo = @{}
+                                $EventInfo.PhaseName = "AppVolumes:[$($stage)]:$($App.AppName)"
+                                $EventInfo.Duration = $Duration.TotalSeconds
+                                $EventInfo.EndTime = $EndRecord.TimeCreated
+                                $EventInfo.StartTime = $StartRecord.TimeCreated
+                                $PSObject = New-Object -TypeName PSObject -Property $EventInfo
+                                if ($EventInfo.Duration) {
+                                    $Script:AppVolumesOutput  += $PSObject
+                                }
+                            }
+                            catch {
+                                Write-Verbose "AppVolumes: Found no start or stop events for $($App.AppName) in $($stage)"
                             }
                         }
                     }
                 }
 
-                #Get Process End Events
-                $PerAppProcessStartEvents = $perAppTimes | Select *| Where {$_.id -eq 4688}
-                foreach ($event in $PerAppProcessStartEvents) {
-                    $BatchStartEvent = ($securityEvents|Where-Object { ($_.Id -eq 4688) -and ($_.Message -like "$($event.message)") -and ($_.TimeCreated -eq $event.Time) }) 
-                    $BatchEndEvent   = ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.properties[$ProcessIdStop].Value -eq $BatchStartEvent.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -like '*cmd.exe*'})
-                    if ($BatchEndEvent -ne $null) {
-                        Write-Debug "Found process end event: $(($BatchEndEvent).TimeCreated) : $(($BatchEndEvent).Message.Substring(0,20))"
-                        #This finds process start events.  Need to find process end events (see further below)
-                        $perAppTimesObject = @{}
-                        $perAppTimesObject | Add-Member -Type NoteProperty -Name Time -Value $($BatchEndEvent.TimeCreated)
-                        $perAppTimesObject | Add-Member -Type NoteProperty -Name ID -Value $($BatchEndEvent.Id)
-                        $perAppTimesObject | Add-Member -Type NoteProperty -Name Message -Value $($BatchEndEvent.Message)
-                        $perAppTimesObject | Add-Member -Type NoteProperty -Name DiskGUID -Value $($event.DiskGUID)
-                        $perAppTimesObject | Add-Member -Type NoteProperty -Name AppDevice -Value $($event.AppDevice)
-                        $perAppTimesObject | Add-Member -Type NoteProperty -Name AppGUID -Value $($event.AppGUID)
-                        $perAppTimesObject | Add-Member -Type NoteProperty -Name AppName -Value $($event.AppName)
-                        $perAppTimesObject | Add-Member -Type NoteProperty -Name EventRecord -Value $($event)
-                        $perAppTimes.Add($perAppTimesObject) | Out-Null
-                    }
-                }
+                if ($AppVolumeVersion -lt [version]"2.12.9.9" ) {
+                $AppVolumesLogonPhase = New-Object -TypeName "System.Collections.ArrayList"
+                $AppVolumesShellStartPhase =  New-Object -TypeName "System.Collections.ArrayList"
 
-                #OK, we finally have all of our information we need to measure everything. We will measure each app for each stage. For each stage
-                #we are going to find the process start and end times and use the process end times to determine when the app completed it's work.
-                #this is because the events AppVolumes generates are ambiguous for when a script finishes or when a stage was complete. If we can't find the event
-                #we're going to have to rely on the events within the capture itself
-                #Find first Logon Event
                 $stages = @("prestartup","startup_postsvc","startup","logon","allvolattached","shellstart")
                 foreach ($App in $AppVolGUIDMappings) {
-                    #$app.AppName
-                    foreach ($stage in $stages) {
+                #Write-Host "$($app.AppName)"
+                foreach ($stage in $stages) {
                         try {
-                            $Events = (($perAppTimes | Select *) |Where {($_.Message -like "*$stage.bat*" -and $_.AppName -eq $($App.AppName)) }).EventRecord
-                            $StartRecord = $Events | Where {$_.Id -eq 4688 -and $_.Message -like "*$stage.bat*"}
+                            $Events = ($perAppTimes |Where {($_.Message -like "*\$stage.bat*" -and $_.AppGUID -eq $($App.AppGuid)) }).EventRecord
+                            $StartRecord = $Events | Where {$_.Id -eq 4688 -and $_.Message -like "*\$stage.bat*"}
                             $EndRecord   = ($securityEvents|Where-Object { $_.Id -eq 4689 -and $_.properties[$ProcessIdStop].Value -eq $StartRecord.Properties[$ProcessIdNew].Value -and $_.properties[$processName].Value -like '*cmd.exe*'})
                             #Write-Verbose "Stage       = $($stage)"
                             #Write-Verbose "AppName     = $($App.AppName)"
@@ -1478,44 +1808,41 @@ function Get-LogonDurationAnalysis {
                             #Get-PhaseEvent -PhaseName " AppVolumes:$($stage):$($App.AppName)" -SharedVars $sharedVars -StartEvent $StartRecord -EndEvent $EndRecord
                             $Duration = New-TimeSpan -Start $StartRecord.TimeCreated -End $EndRecord.TimeCreated
                             $EventInfo = @{}
-                            $EventInfo.PhaseName = " AppVolumes:$($stage):$($App.AppName)"
+                            $EventInfo.PhaseName = "  AppVolumes:[$($stage)]:$($App.AppName)"
                             $EventInfo.Duration = $Duration.TotalSeconds
                             $EventInfo.EndTime = $EndRecord.TimeCreated
                             $EventInfo.StartTime = $StartRecord.TimeCreated
                             $PSObject = New-Object -TypeName PSObject -Property $EventInfo
                             if ($EventInfo.Duration) {
-                                    $Script:Output += $PSObject
+                                $Script:AppVolumesOutput  += $PSObject
+                                $Script:Output  += $PSObject
                             }
                         }
                         catch {
-                            Write-Debug "Found no start or stop events for $($App.AppName) in $($stage)"
+                            Write-Verbose "AppVolumes: Found no start or stop events for $($App.AppName) in $($stage)"
                         }
                     }
                 }
 
-                $AppVolumesLogonPhase = New-Object -TypeName "System.Collections.ArrayList"
-                $AppVolumesShellStartPhase =  New-Object -TypeName "System.Collections.ArrayList"
 
-                foreach ($phase in ($Script:Output | Where {$_.PhaseName -like "*AppVolumes*"})) {
+                $Phases = $Script:AppVolumesOutput | Where {$_.PhaseName -like "*AppVolumes*"}
+                foreach ($phase in $Phases) {
                     if (($phase.phaseName -like "*prestartup*") -or ($phase.phaseName -like "*startup_postsvc*") -or ($phase.phaseName -like "*startup*") -or ($phase.phaseName -like "*logon*") -or ($phase.phaseName -like "*allvolattached*")) {
                         $AppVolumesLogonPhase.Add($phase) | Out-Null
                     }
-
                     if (($phase.phaseName -like "*shellstart*")) {
                         $AppVolumesShellStartPhase.Add($phase) | Out-Null
                     }
-
                 }
 
-                $Duration = New-TimeSpan -Start ($AppVolumesLogonPhase | Sort -Property StartTime)[0].StartTime -End ($AppVolumesLogonPhase | Sort -Property EndTime -Descending)[0].EndTime
                 $EventInfo = @{}
                 $EventInfo.PhaseName = "AppVolumes - Logon"
-                $EventInfo.Duration = $Duration.TotalSeconds
-                $EventInfo.EndTime = ($AppVolumesLogonPhase | Sort -Property EndTime -Descending)[0].EndTime
-                $EventInfo.StartTime = ($AppVolumesLogonPhase | Sort -Property StartTime)[0].StartTime
+                $EventInfo.Duration = (New-TimeSpan -Start (($AppVolumesLogonPhase | Sort -Property StartTime)[0].StartTime) -End (($AppVolumesLogonPhase | Sort -Property EndTime)[-1].EndTime)).TotalSeconds
+                $EventInfo.EndTime = (($AppVolumesLogonPhase | Sort -Property EndTime)[-1].EndTime)
+                $EventInfo.StartTime = (($AppVolumesLogonPhase | Sort -Property StartTime)[0].StartTime).AddMilliseconds(-50) #subtract 50 milliseconds to ensure order is sorted correctly.
                 $PSObject = New-Object -TypeName PSObject -Property $EventInfo
                 if ($EventInfo.Duration) {
-                        $Script:Output += $PSObject
+                    $Script:Output += $PSObject     
                 }
 
                 $Duration = New-TimeSpan -Start ($AppVolumesShellStartPhase | Sort -Property StartTime)[0].StartTime -End ($AppVolumesShellStartPhase | Sort -Property EndTime -Descending)[0].EndTime
@@ -1523,15 +1850,17 @@ function Get-LogonDurationAnalysis {
                 $EventInfo.PhaseName = "AppVolumes - ShellStart"
                 $EventInfo.Duration = $Duration.TotalSeconds
                 $EventInfo.EndTime = ($AppVolumesShellStartPhase | Sort -Property EndTime -Descending)[0].EndTime
-                $EventInfo.StartTime = ($AppVolumesShellStartPhase | Sort -Property StartTime)[0].StartTime
+                $EventInfo.StartTime = (($AppVolumesShellStartPhase | Sort -Property StartTime)[0].StartTime).AddMilliseconds(-50) #subtract 50 milliseconds to ensure order is sorted correctly.
                 $PSObject = New-Object -TypeName PSObject -Property $EventInfo
                 if ($EventInfo.Duration) {
-                        $Script:Output += $PSObject
-                }
-
-            } else {
-            Write-Verbose "AppVolumes log file not found. Skipping AppVolumes enumeration"
-            } 
+                    $Script:Output += $PSObject     
+                } Remove-Variable AppVolumesOutput -Scope Global
+            }
+        } else {
+            Write-Debug "AppVolumes log file not found. Skipping AppVolumes enumeration"
+        } 
+        $FunctionDuration = New-TimeSpan -Start $FunctionStart -End $(Get-Date)
+        Write-Debug "Get-AppVolumesEvents took $($FunctionDuration.TotalSeconds) seconds"
         }
 
         ## Set up runspacepool as we will parallelise some operations
@@ -2465,6 +2794,15 @@ function Get-LogonDurationAnalysis {
             "Group Policy asynchronous scripts were processed for $Script:GPAsync seconds"
         }
         $LogonTaskList | Format-Table @{Expression={$_.TaskName};Label="Logon Sched. Task"},@{Expression={'{0:s\.ff}' -f $_.Duration};Label="Duration (s)"},@{Expression={$_.ActionName};Label="Action Name"} -AutoSize
+
+        if ($Script:AppVolumesOutput) {
+            $AppVolumesFormat = @{Expression={$_.PhaseName};Label="AppVolumes Phase"}, `
+                      @{Expression={'{0:N1}' -f $_.Duration};Label="Duration (s)"}, `
+                      @{Expression={'{0:HH:mm:ss.f}' -f $_.StartTime};Label="Start Time"}, `
+                      @{Expression={'{0:HH:mm:ss.f}' -f $_.EndTime};Label="End Time"}
+            $Script:AppVolumesOutput = $Script:AppVolumesOutput | Sort-Object StartTime
+            ($Script:AppVolumesOutput | Format-Table $AppVolumesFormat -AutoSize | Out-String).Trim()
+        }
     }
 }
 
