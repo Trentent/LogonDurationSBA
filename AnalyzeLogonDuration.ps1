@@ -64,6 +64,7 @@
 [hashtable]$global:citrixUPMParams = @{ 'ProviderName' = 'Citrix Profile Management' }
 [hashtable]$global:printServiceParams = @{ 'ProviderName' = 'Microsoft-Windows-PrintService' }
 [hashtable]$global:windowsShellCoreParams = @{ 'ProviderName' = 'Microsoft-Windows-Shell-Core' }
+[hashtable]$global:winlogonParams = @{ 'ProviderName' = 'Microsoft-Windows-Winlogon' }
 [hashtable]$global:appReadinessParams = @{ 'ProviderName' = 'Microsoft-Windows-AppReadiness' }
 [hashtable]$global:AppVolumesParams = @{ 'ProviderName' = 'svservice' }
 [int]$global:windowsMajorVersion = [System.Environment]::OSVersion.Version.Major
@@ -433,6 +434,7 @@ function Get-LogonDurationAnalysis {
     begin {
         $Script:Output = @()
         $Script:LogonStartDate = $null
+        $Script:UseFSLogixWinLogonEvents = $false
 
         ## array indexes for event log property fields to make retrieval more meaningful
         ## Event id 4688 (process start)
@@ -1215,18 +1217,90 @@ function Get-LogonDurationAnalysis {
                 }
 
                 $SessionEvents = $FSLogixLogObject | Where {$_.Message -like "*LoadProfile: $username*"}
-                $FSLogixStartEvent = $SessionEvents[0].time
-                $FSLogixEndEvent = $SessionEvents[1].time
+                Write-Verbose "FSLogix: SessionEvents Count: $($SessionEvents.message.count)"
+                if ($SessionEvents.message.count -le 1) {
+                    #TTYE - It's been noticed that if TimeZone settings apply during the logon the timestamps in the log file
+                    #will be modified to reflect that, this 
+                    Write-Verbose "FSLogix: Unable to find start or end event in the log file."
+                    Write-Verbose "FSLogix: Will attempt to use WinLogon to track this phase"
+                    if ( $global:winlogonParams[ 'Path' ] -or ( Get-WinEvent -ListProvider 'Microsoft-Windows-Winlogon' -ErrorAction SilentlyContinue)) {
+                        [scriptblock]$winLogonScriptBlock = $null
+                        if( $global:winlogonParams[ 'Path' ] )
+                        {
+                            $winLogonScriptBlock =
+                            {
+                                Param( $logon , $username , $WinlogonFile )
+                                Get-PhaseEvent -PhaseName 'FSLogix: LoadProfile*' -StartProvider 'Microsoft-Windows-Winlogon' `
+                                    -StartEventFile $WinlogonFile `
+                                    -EndEventFile $WinlogonFile `
+                                    -EndProvider 'Microsoft-Windows-Winlogon' -StartXPath (
+                                    New-XPath -EventId 811 -From (Get-Date -Date $Logon.LogonTime) `
+                                        -SecurityData @{
+                                            UserID=$Logon.UserSID
+                                        } -EventData @{
+                                            Event="2"
+                                            SubscriberName="frxsvc"
+                                            }) -EndXPath (
+                                    New-XPath -EventId 812 -From (Get-Date -Date $Logon.LogonTime) `
+                                        -SecurityData @{
+                                            UserID=$Logon.UserSID
+                                        } -EventData @{
+                                            Event="2"
+                                            SubscriberName="frxsvc"
+                                            })
+                            }
+                        }
+                        else ## online
+                        {
+                            $winLogonScriptBlock =
+                            {
+                                Param( $logon )
+                                Get-PhaseEvent -PhaseName 'FSLogix: LoadProfile*' -StartProvider 'Microsoft-Windows-Winlogon' `
+                                    -EndProvider 'Microsoft-Windows-Winlogon' -StartXPath (
+                                    New-XPath -EventId 811 -From (Get-Date -Date $Logon.LogonTime) `
+                                        -SecurityData @{
+                                            UserID=$Logon.UserSID
+                                        } -EventData @{
+                                            Event="2"
+                                            SubscriberName="frxsvc"
+                                            }) -EndXPath (
+                                    New-XPath -EventId 812 -From (Get-Date -Date $Logon.LogonTime) `
+                                        -SecurityData @{
+                                            UserID=$Logon.UserSID
+                                        } -EventData @{
+                                            Event="2"
+                                            SubscriberName="frxsvc"
+                                            })
+                            }
+                        }
+                        $FSLogixWinLogonOutput = Invoke-Command $winLogonScriptBlock -ArgumentList $logon
+                        $Duration = New-TimeSpan -Start $FSLogixWinLogonOutput.StartTime -End $FSLogixWinLogonOutput.EndTime
+                        $EventInfo = @{}
+                        $EventInfo.PhaseName = "FSLogix: LoadProfile*"
+                        $EventInfo.Duration = $Duration.TotalSeconds
+                        $EventInfo.EndTime = $FSLogixWinLogonOutput.EndTime
+                        $EventInfo.StartTime = $FSLogixWinLogonOutput.StartTime
+                        $PSObject = New-Object -TypeName PSObject -Property $EventInfo
+                        if ($EventInfo.Duration) {
+                                $Script:Output += $PSObject
+                        }
+                    }
+        
+                } else {
+                    Write-Verbose "FSLogix: Using FSLogix log file for calculations"
+                    $FSLogixStartEvent = $SessionEvents[0].time
+                    $FSLogixEndEvent = $SessionEvents[1].time
 
-                $Duration = New-TimeSpan -Start $SessionEvents[0].time -End $SessionEvents[1].time
-                $EventInfo = @{}
-                $EventInfo.PhaseName = "FSLogix: LoadProfile"
-                $EventInfo.Duration = $Duration.TotalSeconds
-                $EventInfo.EndTime = $SessionEvents[1].time
-                $EventInfo.StartTime = $SessionEvents[0].time
-                $PSObject = New-Object -TypeName PSObject -Property $EventInfo
-                if ($EventInfo.Duration) {
-                        $Script:Output += $PSObject
+                    $Duration = New-TimeSpan -Start $SessionEvents[0].time -End $SessionEvents[1].time
+                    $EventInfo = @{}
+                    $EventInfo.PhaseName = "FSLogix: LoadProfile"
+                    $EventInfo.Duration = $Duration.TotalSeconds
+                    $EventInfo.EndTime = $SessionEvents[1].time
+                    $EventInfo.StartTime = $SessionEvents[0].time
+                    $PSObject = New-Object -TypeName PSObject -Property $EventInfo
+                    if ($EventInfo.Duration) {
+                            $Script:Output += $PSObject
+                    }
                 }
             }
         }
@@ -1243,8 +1317,11 @@ function Get-LogonDurationAnalysis {
             $End
             )
 
+            if (Test-Path "${env:ProgramFiles(x86)}\CloudVolumes\Agent\Logs\svservice.log") {
             $Script:AppVolumesOutput = @()
             $end = $end.AddMinutes(2)
+            
+
             #region WaitForFirstVolumeOnly
             <#
             https://docs.vmware.com/en/VMware-App-Volumes/2.18/com.vmware.appvolumes.admin.doc/GUID-8CB3E73C-2392-40A2-A19A-825D8D487D08.html
@@ -1309,7 +1386,7 @@ function Get-LogonDurationAnalysis {
             #endregion
 
             $FunctionStart = Get-Date
-            if (Test-Path "${env:ProgramFiles(x86)}\CloudVolumes\Agent\Logs\svservice.log") {
+            
 
                 ## Step 1, Parse the log file to a sortable, searchable object.
 
@@ -1856,10 +1933,12 @@ function Get-LogonDurationAnalysis {
                     $Script:Output += $PSObject     
                 } Remove-Variable AppVolumesOutput -Scope Global
             }
+
+            $FunctionDuration = New-TimeSpan -Start $FunctionStart -End $(Get-Date)
         } else {
             Write-Debug "AppVolumes log file not found. Skipping AppVolumes enumeration"
         } 
-        $FunctionDuration = New-TimeSpan -Start $FunctionStart -End $(Get-Date)
+        
         Write-Debug "Get-AppVolumesEvents took $($FunctionDuration.TotalSeconds) seconds"
         }
 
@@ -2065,6 +2144,7 @@ function Get-LogonDurationAnalysis {
                 'GroupPolicyEventFile' = $global:groupPolicyParams[ 'Path' ]
                 'CitrixUPMEventFile'   = $global:citrixUPMParams[ 'Path' ]
                 'WindowsShellCoreFile'   = $global:windowsShellCoreParams[ 'Path' ]
+                'WinlogonFile'   = $global:winlogonParams[ 'Path' ]
                 'AppReadinessFile'   = $global:AppReadinessParams[ 'Path' ]
                 'AppVolumesFile'   = $global:AppVolumesParams[ 'Path' ]
              }
@@ -2332,6 +2412,122 @@ function Get-LogonDurationAnalysis {
             [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
         }
 
+#region TTYE ActiveSetup time
+
+         if ( $global:windowsShellCoreParams[ 'Path' ] -or ( Get-WinEvent -ListProvider 'Microsoft-Windows-Shell-Core' -ErrorAction SilentlyContinue)) {
+            ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
+
+            [scriptblock]$windowsShellCoreScriptBlock = $null
+            if( $global:windowsShellCoreParams[ 'Path' ] )
+            {
+                $windowsShellCoreScriptBlock =
+                {
+                    Param( $logon , $username , $WindowsShellCoreFile )
+                    Get-PhaseEvent -PhaseName '  Shell:ActiveSetup' -StartProvider 'Microsoft-Windows-Shell-Core' `
+                        -StartEventFile $WindowsShellCoreFile `
+                        -EndEventFile $WindowsShellCoreFile `
+                        -EndProvider 'Microsoft-Windows-Shell-Core' -StartXPath (
+                        New-XPath -EventId 62170 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                TaskName="ActiveSetup"
+                                }) -EndXPath (
+                        New-XPath -EventId 62171 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                TaskName="ActiveSetup"
+                                })
+                }
+            }
+            else ## online
+            {
+                $windowsShellCoreScriptBlock =
+                {
+                    Param( $logon )
+                    Get-PhaseEvent -PhaseName '  Shell:ActiveSetup' -StartProvider 'Microsoft-Windows-Shell-Core' `
+                        -EndProvider 'Microsoft-Windows-Shell-Core' -StartXPath (
+                        New-XPath -EventId 62170 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                TaskName="ActiveSetup"
+                                }) -EndXPath (
+                        New-XPath -EventId 62171 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                TaskName="ActiveSetup"
+                                })
+                }
+            }
+            [void]$PowerShell.AddScript( $windowsShellCoreScriptBlock )
+            [void]$PowerShell.AddParameters( $Parameters )
+            [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
+        }
+#endregion
+
+
+#region TTYE FSLogix ShellStart --> event can be tracked in the Winlogon log
+
+         if ( $global:winlogonParams[ 'Path' ] -or ( Get-WinEvent -ListProvider 'Microsoft-Windows-Winlogon' -ErrorAction SilentlyContinue)) {
+            ($PowerShell = [PowerShell]::Create()).RunspacePool = $RunspacePool
+
+            [scriptblock]$winlogonScriptBlock = $null
+            if( $global:winlogonParams[ 'Path' ] )
+            {
+                $winlogonScriptBlock =
+                {
+                    Param( $logon , $username , $WinlogonFile )
+                    Get-PhaseEvent -PhaseName 'FSLogix:ShellStart' -StartProvider 'Microsoft-Windows-Winlogon' `
+                        -StartEventFile $WinlogonFile `
+                        -EndEventFile $WinlogonFile `
+                        -EndProvider 'Microsoft-Windows-Winlogon' -StartXPath (
+                        New-XPath -EventId 811 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                Event="12"
+                                SubscriberName="frxsvc"
+                                }) -EndXPath (
+                        New-XPath -EventId 812 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                Event="12"
+                                SubscriberName="frxsvc"
+                                })
+                }
+            }
+            else ## online
+            {
+                $winlogonScriptBlock =
+                {
+                    Param( $logon )
+                    Get-PhaseEvent -PhaseName 'FSLogix: ShellStart' -StartProvider 'Microsoft-Windows-Winlogon' `
+                        -EndProvider 'Microsoft-Windows-Winlogon' -StartXPath (
+                        New-XPath -EventId 811 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                Event="12"
+                                SubscriberName="frxsvc"
+                                }) -EndXPath (
+                        New-XPath -EventId 812 -From (Get-Date -Date $Logon.LogonTime) `
+                            -SecurityData @{
+                                UserID=$Logon.UserSID
+                            } -EventData @{
+                                Event="12"
+                                SubscriberName="frxsvc"
+                                })
+                }
+            }
+            [void]$PowerShell.AddScript( $winlogonScriptBlock )
+            [void]$PowerShell.AddParameters( $Parameters )
+            [void]$jobs.Add( [pscustomobject]@{ 'PowerShell' = $PowerShell ; 'Handle' = $PowerShell.BeginInvoke() } )
+        }
+#endregion
 
         ##TTYE AppX file association load time
 
@@ -2786,7 +2982,7 @@ function Get-LogonDurationAnalysis {
                   @{Expression={'{0:HH:mm:ss.f}' -f $_.StartTime};Label="Start Time"}, `
                   @{Expression={'{0:HH:mm:ss.f}' -f $_.EndTime};Label="End Time"}, `
                   @{Expression={'{0:N1}' -f ($_.TimeDelta | `
-                    Select-Object -ExpandProperty TotalSeconds)};Label="Interim Delay"}
+                    Select-Object -ExpandProperty TotalSeconds)};Label="Gap"}
         
         ($Script:Output | Format-Table $Format -AutoSize | Out-String).Trim()
 
@@ -2989,6 +3185,7 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
                 'sched'        { $global:scheduledTasksParams = @{ 'Path' = $file.FullName } ; break }
                 'print'        { $global:printServiceParams = @{ 'Path' = $file.FullName } ; break }
                 'appdefaults'  { $global:windowsShellCoreParams = @{ 'Path' = $file.FullName } ; break }
+                'appdefaults'  { $global:winlogonCoreParams = @{ 'Path' = $file.FullName } ; break }
                 'appreadiness' { $global:appReadinessParams = @{ 'Path' = $file.FullName } ; break }
                 'appvolumes'   { $global:appVolumesParams = @{ 'Path' = $file.FullName } ; break }
             }
@@ -3022,6 +3219,10 @@ if( $args.Count -gt 7 -or $env:CONTROLUP_SUPPORT )
             Write-Warning "Could not find User Print Service operational event log file in `"$global:logsFolder`""
         }
         if( ! $global:windowsShellCoreParams[ 'Path' ] )
+        {
+            Write-Warning "Could not find Windows-Shell-Core AppDefaults event log file in `"$global:logsFolder`""
+        }
+        if( ! $global:winlogonCoreParams[ 'Path' ] )
         {
             Write-Warning "Could not find Windows-Shell-Core AppDefaults event log file in `"$global:logsFolder`""
         }
